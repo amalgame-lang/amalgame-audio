@@ -7,6 +7,30 @@ abstracts the OS-native audio APIs (WASAPI on Windows, Core Audio
 on macOS, ALSA/PulseAudio on Linux) behind a single API — we wrap
 that.
 
+## Prerequisites
+
+miniaudio's implementation `dlopen`s the OS-native audio library
+**at runtime**, so the host machine where the user binary actually
+plays sound needs the matching shared lib installed. **No extra
+package is required at build time** — miniaudio is vendored in
+this package, no `-dev` header to install.
+
+### Runtime (target machine that plays sound)
+
+| OS / distro | Runtime audio library | Install if missing |
+|---|---|---|
+| Debian / Ubuntu | ALSA (default) + PulseAudio | `apt install libasound2 libpulse0` (usually pre-installed) |
+| Fedora / RHEL | ALSA + PulseAudio / PipeWire | `dnf install alsa-lib pulseaudio-libs` (usually pre-installed) |
+| Arch / Manjaro | ALSA + PulseAudio / PipeWire | usually pre-installed |
+| Alpine | ALSA / PulseAudio | `apk add alsa-lib pulseaudio` |
+| macOS | Core Audio | built into the OS, nothing to install |
+| Windows | WASAPI / DirectSound / WinMM | built into the OS, nothing to install |
+| BSD | sndio / OSS | usually pre-installed |
+
+No build-time package is needed on any OS — miniaudio.h is
+header-only and vendored. The `-lm -ldl -lpthread` link flags
+are part of the manifest and forwarded automatically.
+
 ## Install
 
 ```bash
