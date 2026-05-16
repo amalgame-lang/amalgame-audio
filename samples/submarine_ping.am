@@ -1,20 +1,22 @@
 // samples/submarine_ping.am
 //
-// Synthesises the classic sonar-style submarine ping: a 1 kHz pure
-// tone, ~400 ms duration, with a 10 ms attack / release envelope
-// (avoids the click at start/end), then layered with 4 decayed
-// echoes spaced every 700 ms — a credible "ping…ping…ping…ping"
-// sound bath as if the submarine was listening for returns from a
-// distant hull.
+// Submarine sonar ping — fully generated in code, streamed live
+// to the default output device. Nothing touches disk.
 //
-// Total duration ≈ 3.2 s. Written as /tmp/submarine_ping.wav so it
-// can be inspected with any audio player or DAW. If your machine
-// has audio output, Audio.Play also runs the sound through it.
+// Recipe:
+//   1) synth a 1 kHz pure sine, 400 ms long
+//   2) shape with a 10 ms attack / release envelope (kills the
+//      audible click at start/end)
+//   3) attenuate by 0.7 (~-3 dB) so the 4 layered echoes have
+//      headroom and don't clip on the int16 sum
+//   4) overlay 4 decayed copies spaced every 700 ms (decay 0.5)
+//   5) push the resulting ~3.2 s buffer to the default output
+//      device via miniaudio (blocking until the last sample
+//      drains)
 //
 // Build & run:
 //   amc -o submarine_ping submarine_ping.am
-//   ./submarine_ping
-//   aplay /tmp/submarine_ping.wav   # or open in VLC / Audacity / etc.
+//   ./submarine_ping       # PIIIING ... ping ... ping ... ping ...
 
 namespace Demo
 
@@ -22,42 +24,20 @@ import Amalgame.Audio
 
 public class Program {
     public static void Main(string[] args) {
+        let sr: int = 44100
 
-        let sampleRate: int = 44100
-        let outPath: string = "/tmp/submarine_ping.wav"
-
-        Console.WriteLine("synth: 1 kHz sine, 0.4 s ...")
-        let raw = Audio.GenSine(1000.0, 0.4, sampleRate)
-
-        Console.WriteLine("shape: 10 ms ADSR envelope (kill the click)")
-        let shaped = Audio.ApplyEnvelope(raw, 10.0, 10.0, sampleRate)
-
-        // Soften the ping a bit so the echoes have headroom in mix.
-        // 0.7 = -3 dB roughly. Mixing 4 decayed copies would clip
-        // hard otherwise.
+        Console.WriteLine("generating sonar ping ...")
+        let raw      = Audio.GenSine(1000.0, 0.4, sr)
+        let shaped   = Audio.ApplyEnvelope(raw, 10.0, 10.0, sr)
         let softened = Audio.Scale(shaped, 0.7)
+        let full     = Audio.Echo(softened, 700.0, 0.5, 4, sr)
 
-        Console.WriteLine("echo:  4 returns, 700 ms spacing, 0.5 decay")
-        let full = Audio.Echo(softened, 700.0, 0.5, 4, sampleRate)
-
-        Console.WriteLine("save:  " + outPath)
-        let ok: bool = Audio.SaveAsWav(full, sampleRate, outPath)
-        if (!ok) {
-            Console.WriteLine("FAIL  SaveAsWav: " + Audio.LastError())
-            return
-        }
-        Console.WriteLine("OK    wrote /tmp/submarine_ping.wav")
-
-        // Best-effort playback. If the CI / container has no audio
-        // device, Audio.Play returns false silently — the WAV is
-        // still on disk for offline listening.
-        Console.WriteLine("play: streaming through default device ...")
-        let played: bool = Audio.Play(full, sampleRate)
-        if (played) {
-            Console.WriteLine("OK    playback complete")
+        Console.WriteLine("streaming to default audio device ...")
+        let ok: bool = Audio.Play(full, sr)
+        if (ok) {
+            Console.WriteLine("done.")
         } else {
-            Console.WriteLine("note  no audio device available: "
-                + Audio.LastError() + " (WAV still saved)")
+            Console.WriteLine("no audio device: " + Audio.LastError())
         }
     }
 }
