@@ -1,0 +1,63 @@
+// samples/submarine_ping.am
+//
+// Synthesises the classic sonar-style submarine ping: a 1 kHz pure
+// tone, ~400 ms duration, with a 10 ms attack / release envelope
+// (avoids the click at start/end), then layered with 4 decayed
+// echoes spaced every 700 ms — a credible "ping…ping…ping…ping"
+// sound bath as if the submarine was listening for returns from a
+// distant hull.
+//
+// Total duration ≈ 3.2 s. Written as /tmp/submarine_ping.wav so it
+// can be inspected with any audio player or DAW. If your machine
+// has audio output, Audio.Play also runs the sound through it.
+//
+// Build & run:
+//   amc -o submarine_ping submarine_ping.am
+//   ./submarine_ping
+//   aplay /tmp/submarine_ping.wav   # or open in VLC / Audacity / etc.
+
+namespace Demo
+
+import Amalgame.Audio
+
+public class Program {
+    public static void Main(string[] args) {
+
+        let sampleRate: int = 44100
+        let outPath: string = "/tmp/submarine_ping.wav"
+
+        Console.WriteLine("synth: 1 kHz sine, 0.4 s ...")
+        let raw = Audio.GenSine(1000.0, 0.4, sampleRate)
+
+        Console.WriteLine("shape: 10 ms ADSR envelope (kill the click)")
+        let shaped = Audio.ApplyEnvelope(raw, 10.0, 10.0, sampleRate)
+
+        // Soften the ping a bit so the echoes have headroom in mix.
+        // 0.7 = -3 dB roughly. Mixing 4 decayed copies would clip
+        // hard otherwise.
+        let softened = Audio.Scale(shaped, 0.7)
+
+        Console.WriteLine("echo:  4 returns, 700 ms spacing, 0.5 decay")
+        let full = Audio.Echo(softened, 700.0, 0.5, 4, sampleRate)
+
+        Console.WriteLine("save:  " + outPath)
+        let ok: bool = Audio.SaveAsWav(full, sampleRate, outPath)
+        if (!ok) {
+            Console.WriteLine("FAIL  SaveAsWav: " + Audio.LastError())
+            return
+        }
+        Console.WriteLine("OK    wrote /tmp/submarine_ping.wav")
+
+        // Best-effort playback. If the CI / container has no audio
+        // device, Audio.Play returns false silently — the WAV is
+        // still on disk for offline listening.
+        Console.WriteLine("play: streaming through default device ...")
+        let played: bool = Audio.Play(full, sampleRate)
+        if (played) {
+            Console.WriteLine("OK    playback complete")
+        } else {
+            Console.WriteLine("note  no audio device available: "
+                + Audio.LastError() + " (WAV still saved)")
+        }
+    }
+}
