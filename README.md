@@ -35,7 +35,7 @@ are part of the manifest and forwarded automatically.
 
 ```bash
 amc package add audio                                  # via index
-amc package add github.com/amalgame-lang/amalgame-audio@v0.1.0
+amc package add github.com/amalgame-lang/amalgame-audio@v0.2.0
 ```
 
 Requires **amc 0.5.4+** (precompile-on-install — miniaudio's
@@ -86,6 +86,35 @@ public class Beep {
 | **Diag** | | |
 | `Audio.LastError()` | `string` | Empty on success |
 
+### v0.2.0 additions — multi-format decoders + sondes
+
+| Method | Returns | Notes |
+|---|---|---|
+| `Audio.Load(path)` | `List<int>` | Auto-detects WAV / MP3 / FLAC / OGG via magic bytes |
+| `Audio.LoadMp3(path)` | `List<int>` | Same impl, explicit verb for call-site clarity |
+| `Audio.LoadFlac(path)` | `List<int>` | Same impl, explicit verb |
+| `Audio.LoadOgg(path)` | `List<int>` | Same impl, explicit verb |
+| `Audio.SampleRateOf(path)` | `int` (Hz) | Inspect without loading; returns 0 on failure |
+| `Audio.ChannelCountOf(path)` | `int` | 1 = mono, 2 = stereo, … |
+| `Audio.DurationMsOf(path)` | `int` (ms) | Total playback duration |
+
+```amalgame
+// Load any audio file the codec stack recognises and inspect
+// its native rate / channel count / duration before deciding
+// what to do with it.
+let buf = Audio.Load("/tmp/whatever.mp3")
+Console.WriteLine("rate: " + String_FromInt(Audio.SampleRateOf("/tmp/whatever.mp3")))
+Console.WriteLine("ch:   " + String_FromInt(Audio.ChannelCountOf("/tmp/whatever.mp3")))
+Console.WriteLine("dur:  " + String_FromInt(Audio.DurationMsOf("/tmp/whatever.mp3")) + " ms")
+Audio.Play(buf, Audio.SampleRateOf("/tmp/whatever.mp3"))
+```
+
+All loaders downmix to mono int16 — multi-channel pipelines are
+v0.3+. The `.o` produced from `ma_impl.c` grows from ~250 KB
+(WAV-only v0.1) to ~1 MB (v0.2 with MP3/FLAC/OGG enabled);
+acceptable for native multi-format playback without forking the
+package per codec.
+
 ### Sample format
 
 All v1 surface operates on **16-bit signed PCM mono samples**, with
@@ -119,12 +148,11 @@ amc -o submarine_ping submarine_ping.am
 aplay /tmp/submarine_ping.wav    # or open in any audio player
 ```
 
-## Deferred to v2
+## Deferred to v0.3+
 
 - Capture (mic input) — needs the dual-callback shape
 - Real-time synth via user-provided callback (callbacks interact
   subtly with bdwgc thread pinning)
-- MP3 / FLAC / Vorbis decode (toggle `MA_NO_*` in `ma_impl.c`)
 - Pitch shift / time stretch / FFT analysis
 - Mixing graph / spatial audio / HRTF
 - Stereo and float32 sample formats

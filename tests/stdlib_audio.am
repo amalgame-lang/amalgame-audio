@@ -127,5 +127,54 @@ public class Program {
         } else {
             Console.WriteLine("[FAIL] WAV round-trip sample diverged")
         }
+
+        // ═══════════════════════════════════════════════════════
+        //  v0.2 — sondes + format-agnostic Load
+        // ═══════════════════════════════════════════════════════
+
+        // ── 9. SampleRateOf reads back the rate we saved ──────
+        let rateBack: int = Audio.SampleRateOf(path)
+        if (rateBack == sr) {
+            Console.WriteLine("[PASS] SampleRateOf returns " + String_FromInt(sr))
+        } else {
+            Console.WriteLine("[FAIL] SampleRateOf got "
+                + String_FromInt(rateBack))
+        }
+
+        // ── 10. ChannelCountOf — mono = 1 ─────────────────────
+        let chBack: int = Audio.ChannelCountOf(path)
+        if (chBack == 1) {
+            Console.WriteLine("[PASS] ChannelCountOf returns 1 for mono WAV")
+        } else {
+            Console.WriteLine("[FAIL] ChannelCountOf got "
+                + String_FromInt(chBack))
+        }
+
+        // ── 11. DurationMsOf — 0.1s × 44100 = 100ms ───────────
+        let durMs: int = Audio.DurationMsOf(path)
+        if (durMs == 100) {
+            Console.WriteLine("[PASS] DurationMsOf returns 100 for 0.1s sine")
+        } else {
+            Console.WriteLine("[FAIL] DurationMsOf got "
+                + String_FromInt(durMs))
+        }
+
+        // ── 12. Load (format-agnostic) ────────────────────────
+        let agnostic = Audio.Load(path)
+        if (agnostic.Count() == sine.Count()) {
+            Console.WriteLine("[PASS] Load auto-detects WAV")
+        } else {
+            Console.WriteLine("[FAIL] Load got "
+                + String_FromInt(agnostic.Count()))
+        }
+
+        // ── 13. Probes on missing file return 0 (error path) ──
+        let bogus: int = Audio.SampleRateOf("/tmp/does_not_exist.wav")
+        if (bogus == 0) {
+            Console.WriteLine("[PASS] SampleRateOf rejects missing file")
+        } else {
+            Console.WriteLine("[FAIL] SampleRateOf got "
+                + String_FromInt(bogus))
+        }
     }
 }

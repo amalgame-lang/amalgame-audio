@@ -36,11 +36,29 @@ AAudio / OpenSL ES on Android, Web Audio on the Web. ~4 MB / ~100 000
 LoC of portable C. Upstream:
 [github.com/mackron/miniaudio](https://github.com/mackron/miniaudio).
 
-The lossy decoders (MP3 / FLAC / Vorbis) are disabled at compile
-time in `runtime/vendor/ma_impl.c` to shrink the .o and avoid the
-patent / licence considerations of those formats. WAV stays enabled
-both directions for round-tripping. Users who need MP3/FLAC/OGG
-decode can fork the package and toggle the `MA_NO_*` defines.
+### dr_libs / stb_vorbis (bundled with miniaudio, v0.2+)
+
+Starting with amalgame-audio v0.2, miniaudio's bundled lossy
+decoders are enabled — `runtime/vendor/ma_impl.c` no longer
+defines `MA_NO_FLAC` / `MA_NO_MP3` / `MA_NO_VORBIS`. The decoders
+themselves are vendored inside `miniaudio.h`:
+
+- **dr_mp3** by David Reid — public-domain (Unlicense) / MIT-0
+  MPEG-1 Audio Layer III decoder.
+- **dr_flac** by David Reid — public-domain (Unlicense) / MIT-0
+  FLAC decoder.
+- **stb_vorbis** by Sean Barrett — public-domain (Unlicense) /
+  MIT-0 Ogg Vorbis decoder.
+
+All three are dual-licensed identically to miniaudio (public
+domain / MIT-0). The `.o` produced from `ma_impl.c` grows from
+~250 KB (v0.1 WAV-only) to ~1 MB (v0.2 with all codecs) as a
+result. No external link-time dep is added — these decoders are
+header-only and travel inside miniaudio.h.
+
+**MP3 patent note**: the MP3 format itself is patent-free
+worldwide (the final US patents expired 2017-12-30). FLAC and
+Vorbis have always been royalty-free.
 
 ## Trademarks
 

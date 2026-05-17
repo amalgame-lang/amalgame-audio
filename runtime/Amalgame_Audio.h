@@ -45,6 +45,15 @@
  *       Process-global last-error string (cleared on each successful
  *       call). Empty when no error has happened yet.
  *
+ *   ── v0.2 — multi-format decoders + sondes ──
+ *   Audio.Load(path)              -> List<int>   auto-sniff WAV/MP3/FLAC/OGG
+ *   Audio.LoadMp3(path)           -> List<int>
+ *   Audio.LoadFlac(path)          -> List<int>
+ *   Audio.LoadOgg(path)           -> List<int>
+ *   Audio.SampleRateOf(path)      -> int (Hz)
+ *   Audio.ChannelCountOf(path)    -> int (1 = mono, 2 = stereo, …)
+ *   Audio.DurationMsOf(path)      -> int (milliseconds)
+ *
  * Threading: synthesis / transformation are pure (return new
  * buffers). Play is blocking single-threaded; one Play call per
  * thread. Concurrent SaveAsWav/LoadWav calls against distinct
@@ -464,6 +473,133 @@ static inline code_bool Amalgame_Audio_Play(AmalgameList* samples, i64 sampleRat
     free(pcm);
     _amaudio_set_error(NULL);
     return 1;
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  v0.2 — multi-format decoders + sondes
+ * ═══════════════════════════════════════════════════════
+ *
+ * ma_impl.c (v0.2) enables MP3 / FLAC / Vorbis decoding via the
+ * dr_libs implementations bundled with miniaudio. The single
+ * `ma_decoder_init_file` entry point already auto-detects format
+ * via magic bytes, so the per-format Load* verbs below are thin
+ * wrappers — useful when call-site code wants to express its
+ * intent in the verb name. `Load` is the format-agnostic verb.
+ *
+ * All loaders return List<int> of int16 mono samples regardless of
+ * the source's native format / channel count / bit-depth —
+ * miniaudio converts on the fly. Use SampleRateOf to recover the
+ * native sample rate from the file (so Play / SaveAsWav can
+ * round-trip).
+ */
+
+/* Shared helper — load any file format miniaudio recognises into
+ * a List<int> of int16 mono samples. Native sample rate is left
+ * unchanged (miniaudio resamples only if the decoder config asks
+ * for a specific rate; we pass 0 to keep the source rate). */
+static inline AmalgameList* _amaudio_load_decoder(code_string path, const char* verb) {
+    if (!path) {
+        _amaudio_set_error(verb);
+        return AmalgameList_new();
+    }
+    /* sampleRate=0 → keep source rate. format=s16, channels=1 →
+     * downmix + bit-depth convert. */
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 1, 0);
+    ma_decoder dec;
+    if (ma_decoder_init_file(path, &cfg, &dec) != MA_SUCCESS) {
+        _amaudio_set_error(verb);
+        return AmalgameList_new();
+    }
+    ma_uint64 total = 0;
+    if (ma_decoder_get_length_in_pcm_frames(&dec, &total) != MA_SUCCESS) {
+        ma_decoder_uninit(&dec);
+        _amaudio_set_error(verb);
+        return AmalgameList_new();
+    }
+    int16_t* pcm = (int16_t*) malloc((size_t) total * sizeof(int16_t));
+    if (!pcm) {
+        ma_decoder_uninit(&dec);
+        _amaudio_set_error(verb);
+        return AmalgameList_new();
+    }
+    ma_uint64 got = 0;
+    ma_decoder_read_pcm_frames(&dec, pcm, total, &got);
+    ma_decoder_uninit(&dec);
+    AmalgameList* out = _amaudio_buf_from_pcm(pcm, (size_t) got);
+    free(pcm);
+    _amaudio_set_error(NULL);
+    return out;
+}
+
+/* Format-agnostic loader. miniaudio sniffs the magic bytes —
+ * works for WAV / MP3 / FLAC / OGG-Vorbis. Returns an empty
+ * List on failure (LastError carries the reason). */
+static inline AmalgameList* Amalgame_Audio_Load(code_string path) {
+    return _amaudio_load_decoder(path, "Load: ma_decoder_init_file failed");
+}
+
+/* Per-format loaders — same implementation as Load, distinct
+ * verb so call-site code can express its intent. */
+static inline AmalgameList* Amalgame_Audio_LoadMp3(code_string path) {
+    return _amaudio_load_decoder(path, "LoadMp3: ma_decoder_init_file failed");
+}
+static inline AmalgameList* Amalgame_Audio_LoadFlac(code_string path) {
+    return _amaudio_load_decoder(path, "LoadFlac: ma_decoder_init_file failed");
+}
+static inline AmalgameList* Amalgame_Audio_LoadOgg(code_string path) {
+    return _amaudio_load_decoder(path, "LoadOgg: ma_decoder_init_file failed");
+}
+
+/* ── Sondes — inspect a file without loading the whole buffer ─ */
+
+/* Sample rate of the audio file (Hz). Returns 0 on failure. */
+static inline i64 Amalgame_Audio_SampleRateOf(code_string path) {
+    if (!path) { _amaudio_set_error("SampleRateOf: null path"); return 0; }
+    ma_decoder dec;
+    if (ma_decoder_init_file(path, NULL, &dec) != MA_SUCCESS) {
+        _amaudio_set_error("SampleRateOf: ma_decoder_init_file failed");
+        return 0;
+    }
+    i64 rate = (i64) dec.outputSampleRate;
+    ma_decoder_uninit(&dec);
+    _amaudio_set_error(NULL);
+    return rate;
+}
+
+/* Channel count of the audio file. Returns 0 on failure. */
+static inline i64 Amalgame_Audio_ChannelCountOf(code_string path) {
+    if (!path) { _amaudio_set_error("ChannelCountOf: null path"); return 0; }
+    ma_decoder dec;
+    if (ma_decoder_init_file(path, NULL, &dec) != MA_SUCCESS) {
+        _amaudio_set_error("ChannelCountOf: ma_decoder_init_file failed");
+        return 0;
+    }
+    i64 ch = (i64) dec.outputChannels;
+    ma_decoder_uninit(&dec);
+    _amaudio_set_error(NULL);
+    return ch;
+}
+
+/* Total playback duration in milliseconds. Returns 0 on failure
+ * (or on streams of unknown length, e.g. a malformed MP3). */
+static inline i64 Amalgame_Audio_DurationMsOf(code_string path) {
+    if (!path) { _amaudio_set_error("DurationMsOf: null path"); return 0; }
+    ma_decoder dec;
+    if (ma_decoder_init_file(path, NULL, &dec) != MA_SUCCESS) {
+        _amaudio_set_error("DurationMsOf: ma_decoder_init_file failed");
+        return 0;
+    }
+    ma_uint64 frames = 0;
+    if (ma_decoder_get_length_in_pcm_frames(&dec, &frames) != MA_SUCCESS) {
+        ma_decoder_uninit(&dec);
+        _amaudio_set_error("DurationMsOf: get_length failed");
+        return 0;
+    }
+    i64 rate = (i64) dec.outputSampleRate;
+    ma_decoder_uninit(&dec);
+    _amaudio_set_error(NULL);
+    if (rate <= 0) return 0;
+    return (i64) ((frames * 1000) / (ma_uint64) rate);
 }
 
 #endif /* AMALGAME_AUDIO_H */
