@@ -1,0 +1,92 @@
+# Package manifest — amalgame-audio
+#
+# Audio synthesis, playback and capture for Amalgame, built on
+# David Reid's public-domain miniaudio single-header library.
+# miniaudio abstracts the OS-native audio APIs behind a single
+# API (WASAPI on Windows, Core Audio on macOS, ALSA/PulseAudio
+# on Linux). Vendored at runtime/vendor/miniaudio.h — no
+# external dep at link time.
+#
+# Surface (v0.1):
+#   Synthesis:    GenSine / GenSquare / GenTriangle /
+#                 GenNoise / GenSilence
+#   Transform:    ApplyEnvelope / Scale / Mix / Echo
+#   IO:           SaveAsWav / LoadWav / Play
+#   Diag:         LastError
+#
+# Sample format: 16-bit signed PCM mono. Multi-channel + 32-bit
+# float pipelines are v0.3+.
+#
+# Surface (v0.2 additions):
+#   Multi-format load:  Load / LoadMp3 / LoadFlac / LoadOgg
+#   Sondes:             SampleRateOf / ChannelCountOf / DurationMsOf
+#
+# Out of scope (v0.3+):
+#   - Capture (mic input) — needs the dual-callback pattern,
+#     subtle interaction with bdwgc thread pinning
+#   - Real-time synthesis via user-provided callback
+#   - Pitch shift / time stretch / FFT analysis
+#   - Mixing graph / spatial audio / HRTF
+#   - Multi-channel pipelines (stereo / surround) — v0.2 keeps
+#     mono int16 as the canonical buffer type
+#
+# Installation:
+#
+#   amc package add audio                                # via index
+#   amc package add github.com/amalgame-lang/amalgame-audio@v0.2.0
+
+[package]
+name              = "amalgame-audio"
+version           = "0.2.0"
+license           = "Apache-2.0"
+description       = "Audio synth + playback + multi-format decode (WAV/MP3/FLAC/OGG) for Amalgame — miniaudio (public domain), vendored."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.5.4"
+schema-version    = 1
+
+[stdlib]
+class     = "Audio"
+header    = "runtime/Amalgame_Audio.h"
+namespace = "Amalgame.Audio"
+
+# miniaudio implementation, materialised in one TU.
+# Precompiled once at `amc package add` time; reused across
+# every subsequent build via the platform-keyed cache.
+# v0.2: MP3/FLAC/Vorbis decoders now enabled (.o grows from
+# ~250 KB → ~1 MB).
+sources    = ["runtime/vendor/ma_impl.c"]
+precompile = true
+
+# miniaudio is a single, large header; -O2 keeps decode/encode
+# hot paths tight. -w stays under amc's own quieter flag.
+cflags     = "-O2"
+
+# Platform link flags — miniaudio defers to OS-native libs at
+# runtime. amc forwards these to the user's gcc invocation.
+libs       = ["m", "dl", "pthread"]
+
+[stdlib.functions]
+GenSine        = { returns = "AmalgameList*" }
+GenSquare      = { returns = "AmalgameList*" }
+GenTriangle    = { returns = "AmalgameList*" }
+GenNoise       = { returns = "AmalgameList*" }
+GenSilence     = { returns = "AmalgameList*" }
+ApplyEnvelope  = { returns = "AmalgameList*" }
+Scale          = { returns = "AmalgameList*" }
+Mix            = { returns = "AmalgameList*" }
+Echo           = { returns = "AmalgameList*" }
+SaveAsWav      = { returns = "code_bool" }
+LoadWav        = { returns = "AmalgameList*" }
+Play           = { returns = "code_bool" }
+LastError      = { returns = "code_string" }
+
+# v0.2 — multi-format decoders + sondes
+Load             = { returns = "AmalgameList*" }
+LoadMp3          = { returns = "AmalgameList*" }
+LoadFlac         = { returns = "AmalgameList*" }
+LoadOgg          = { returns = "AmalgameList*" }
+SampleRateOf     = { returns = "i64" }
+ChannelCountOf   = { returns = "i64" }
+DurationMsOf     = { returns = "i64" }
+
+[dependencies]

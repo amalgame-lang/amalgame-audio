@@ -1,0 +1,43 @@
+// samples/submarine_ping.am
+//
+// Submarine sonar ping — fully generated in code, streamed live
+// to the default output device. Nothing touches disk.
+//
+// Recipe:
+//   1) synth a 1 kHz pure sine, 400 ms long
+//   2) shape with a 10 ms attack / release envelope (kills the
+//      audible click at start/end)
+//   3) attenuate by 0.7 (~-3 dB) so the 4 layered echoes have
+//      headroom and don't clip on the int16 sum
+//   4) overlay 4 decayed copies spaced every 700 ms (decay 0.5)
+//   5) push the resulting ~3.2 s buffer to the default output
+//      device via miniaudio (blocking until the last sample
+//      drains)
+//
+// Build & run:
+//   amc -o submarine_ping submarine_ping.am
+//   ./submarine_ping       # PIIIING ... ping ... ping ... ping ...
+
+namespace Demo
+
+import Amalgame.Audio
+
+public class Program {
+    public static void Main(string[] args) {
+        let sr: int = 44100
+
+        Console.WriteLine("generating sonar ping ...")
+        let raw      = Audio.GenSine(1000.0, 0.4, sr)
+        let shaped   = Audio.ApplyEnvelope(raw, 10.0, 10.0, sr)
+        let softened = Audio.Scale(shaped, 0.7)
+        let full     = Audio.Echo(softened, 700.0, 0.5, 4, sr)
+
+        Console.WriteLine("streaming to default audio device ...")
+        let ok: bool = Audio.Play(full, sr)
+        if (ok) {
+            Console.WriteLine("done.")
+        } else {
+            Console.WriteLine("no audio device: " + Audio.LastError())
+        }
+    }
+}

@@ -1,0 +1,180 @@
+// Stdlib test: Amalgame.Audio — synth + transform + WAV IO.
+// Deterministic: synthesis is pure, WAV round-trip is lossless.
+// Audio.Play is NOT tested (silent CI machines have no usable
+// output device). The submarine_ping.am sample covers playback.
+
+namespace Tests
+
+import Amalgame.Audio
+
+public class Program {
+    public static void Main(string[] args) {
+
+        let sr: int = 44100
+
+        // ── 1. GenSine — sample count matches duration × sr ───
+        let sine = Audio.GenSine(440.0, 0.1, sr)   // 100 ms A4
+        if (sine.Count() == 4410) {
+            Console.WriteLine("[PASS] GenSine length")
+        } else {
+            Console.WriteLine("[FAIL] GenSine length got "
+                + String_FromInt(sine.Count()))
+        }
+
+        // ── 2. GenSilence — same length, all zeros ────────────
+        let sil = Audio.GenSilence(0.1, sr)
+        if (sil.Count() == 4410 && sil.Get(0) == 0 && sil.Get(2200) == 0) {
+            Console.WriteLine("[PASS] GenSilence is silent")
+        } else {
+            Console.WriteLine("[FAIL] GenSilence got Get(0)="
+                + String_FromInt(sil.Get(0)))
+        }
+
+        // ── 3. Sine extremum is near int16 max ────────────────
+        // For a pure sine at 440 Hz / 44100 Hz, the first sample's
+        // peak is in the first ~25 samples. Scan for the max abs.
+        let n: int = sine.Count()
+        var peak: int = 0
+        var i: int = 0
+        while (i < n) {
+            let v: int = sine.Get(i)
+            let a: int = v
+            if (a < 0) { i = i + 1; continue }
+            if (a > peak) { peak = a }
+            i = i + 1
+        }
+        // Expect ~32760 (int16_max - rounding); allow some slack.
+        if (peak > 32000 && peak <= 32767) {
+            Console.WriteLine("[PASS] sine peak ~int16 max ("
+                + String_FromInt(peak) + ")")
+        } else {
+            Console.WriteLine("[FAIL] sine peak got "
+                + String_FromInt(peak))
+        }
+
+        // ── 4. Envelope — first sample is ~0 (attack ramp) ────
+        let shaped = Audio.ApplyEnvelope(sine, 10.0, 10.0, sr)
+        let first: int = shaped.Get(0)
+        if (first == 0) {
+            Console.WriteLine("[PASS] envelope first sample = 0")
+        } else {
+            Console.WriteLine("[FAIL] envelope first sample = "
+                + String_FromInt(first))
+        }
+
+        // ── 5. Scale 0.5 halves the magnitudes (sample 1000) ──
+        let half = Audio.Scale(sine, 0.5)
+        let s1: int = sine.Get(1000)
+        let s2: int = half.Get(1000)
+        let diff: int = (s1 / 2) - s2
+        // Allow ±1 for rounding — compute |diff| via a var, then
+        // single bounds check. Amalgame's parser is picky about
+        // `>= a - b && c` chains, so we sidestep with a fold.
+        var absDiff: int = diff
+        if (absDiff < 0) { absDiff = 0 - absDiff }
+        if (absDiff <= 1) {
+            Console.WriteLine("[PASS] Scale 0.5 halves sample 1000")
+        } else {
+            Console.WriteLine("[FAIL] Scale: s1=" + String_FromInt(s1)
+                + " s2=" + String_FromInt(s2) + " diff=" + String_FromInt(diff))
+        }
+
+
+        // ── 6. Mix — overlay silence offset 0 is identity ─────
+        let mix1 = Audio.Mix(sine, sil, 0)
+        let lenOk: bool   = mix1.Count() == sine.Count()
+        let valOk: bool   = mix1.Get(500) == sine.Get(500)
+        if (lenOk && valOk) {
+            Console.WriteLine("[PASS] Mix with silence is identity")
+        } else {
+            Console.WriteLine("[FAIL] Mix vs silence diverged at 500")
+        }
+
+        // ── 7. Echo — output length matches formula ───────────
+        // Length = len(samples) + repeats * (delayMs * sr / 1000)
+        let echoed = Audio.Echo(sine, 100.0, 0.5, 3, sr)
+        let expect = 4410 + 3 * 4410   // 100ms at 44100 = 4410
+        if (echoed.Count() == expect) {
+            Console.WriteLine("[PASS] Echo length matches formula")
+        } else {
+            Console.WriteLine("[FAIL] Echo length got "
+                + String_FromInt(echoed.Count())
+                + " expected " + String_FromInt(expect))
+        }
+
+        // ── 8. SaveAsWav + LoadWav round-trip ────────────────
+        let path: string = "/tmp/amc_audio_test.wav"
+        let ok: bool = Audio.SaveAsWav(sine, sr, path)
+        if (ok) {
+            Console.WriteLine("[PASS] SaveAsWav")
+        } else {
+            Console.WriteLine("[FAIL] SaveAsWav: " + Audio.LastError())
+            return
+        }
+        let back = Audio.LoadWav(path)
+        if (back.Count() == sine.Count()) {
+            Console.WriteLine("[PASS] LoadWav length round-trip")
+        } else {
+            Console.WriteLine("[FAIL] LoadWav got "
+                + String_FromInt(back.Count())
+                + " expected " + String_FromInt(sine.Count()))
+        }
+        // Sample-exact equality across WAV round-trip (int16 PCM is lossless)
+        let exact1: bool = back.Get(100)  == sine.Get(100)
+        let exact2: bool = back.Get(2000) == sine.Get(2000)
+        if (exact1 && exact2) {
+            Console.WriteLine("[PASS] WAV round-trip sample-exact")
+        } else {
+            Console.WriteLine("[FAIL] WAV round-trip sample diverged")
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  v0.2 — sondes + format-agnostic Load
+        // ═══════════════════════════════════════════════════════
+
+        // ── 9. SampleRateOf reads back the rate we saved ──────
+        let rateBack: int = Audio.SampleRateOf(path)
+        if (rateBack == sr) {
+            Console.WriteLine("[PASS] SampleRateOf returns " + String_FromInt(sr))
+        } else {
+            Console.WriteLine("[FAIL] SampleRateOf got "
+                + String_FromInt(rateBack))
+        }
+
+        // ── 10. ChannelCountOf — mono = 1 ─────────────────────
+        let chBack: int = Audio.ChannelCountOf(path)
+        if (chBack == 1) {
+            Console.WriteLine("[PASS] ChannelCountOf returns 1 for mono WAV")
+        } else {
+            Console.WriteLine("[FAIL] ChannelCountOf got "
+                + String_FromInt(chBack))
+        }
+
+        // ── 11. DurationMsOf — 0.1s × 44100 = 100ms ───────────
+        let durMs: int = Audio.DurationMsOf(path)
+        if (durMs == 100) {
+            Console.WriteLine("[PASS] DurationMsOf returns 100 for 0.1s sine")
+        } else {
+            Console.WriteLine("[FAIL] DurationMsOf got "
+                + String_FromInt(durMs))
+        }
+
+        // ── 12. Load (format-agnostic) ────────────────────────
+        let agnostic = Audio.Load(path)
+        if (agnostic.Count() == sine.Count()) {
+            Console.WriteLine("[PASS] Load auto-detects WAV")
+        } else {
+            Console.WriteLine("[FAIL] Load got "
+                + String_FromInt(agnostic.Count()))
+        }
+
+        // ── 13. Probes on missing file return 0 (error path) ──
+        let bogus: int = Audio.SampleRateOf("/tmp/does_not_exist.wav")
+        if (bogus == 0) {
+            Console.WriteLine("[PASS] SampleRateOf rejects missing file")
+        } else {
+            Console.WriteLine("[FAIL] SampleRateOf got "
+                + String_FromInt(bogus))
+        }
+    }
+}
