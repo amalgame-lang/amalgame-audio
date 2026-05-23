@@ -15,31 +15,33 @@
 #   Diag:         LastError
 #
 # Sample format: 16-bit signed PCM mono. Multi-channel + 32-bit
-# float pipelines are v0.3+.
+# float pipelines are v0.4+.
 #
 # Surface (v0.2 additions):
 #   Multi-format load:  Load / LoadMp3 / LoadFlac / LoadOgg
 #   Sondes:             SampleRateOf / ChannelCountOf / DurationMsOf
 #
-# Out of scope (v0.3+):
-#   - Capture (mic input) — needs the dual-callback pattern,
-#     subtle interaction with bdwgc thread pinning
+# Surface (v0.3 additions):
+#   Capture:    Record (blocking) / RecordStart / RecordStop /
+#               RecordIsActive / RecordSampleCount
+#
+# Out of scope (v0.4+):
 #   - Real-time synthesis via user-provided callback
 #   - Pitch shift / time stretch / FFT analysis
 #   - Mixing graph / spatial audio / HRTF
-#   - Multi-channel pipelines (stereo / surround) — v0.2 keeps
+#   - Multi-channel pipelines (stereo / surround) — v0.3 keeps
 #     mono int16 as the canonical buffer type
 #
 # Installation:
 #
 #   amc package add audio                                # via index
-#   amc package add github.com/amalgame-lang/amalgame-audio@v0.2.0
+#   amc package add github.com/amalgame-lang/amalgame-audio@v0.3.0
 
 [package]
 name              = "amalgame-audio"
-version           = "0.2.0"
+version           = "0.3.0"
 license           = "Apache-2.0"
-description       = "Audio synth + playback + multi-format decode (WAV/MP3/FLAC/OGG) for Amalgame — miniaudio (public domain), vendored."
+description       = "Audio synth + playback + capture + multi-format decode (WAV/MP3/FLAC/OGG) for Amalgame — miniaudio (public domain), vendored."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.5.4"
 schema-version    = 1
@@ -88,5 +90,12 @@ LoadOgg          = { returns = "AmalgameList*" }
 SampleRateOf     = { returns = "i64" }
 ChannelCountOf   = { returns = "i64" }
 DurationMsOf     = { returns = "i64" }
+
+# v0.3 — mic capture
+Record             = { returns = "AmalgameList*" }
+RecordStart        = { returns = "AmalgameAudioRec*" }
+RecordStop         = { returns = "AmalgameList*" }
+RecordIsActive     = { returns = "code_bool" }
+RecordSampleCount  = { returns = "i64" }
 
 [dependencies]
