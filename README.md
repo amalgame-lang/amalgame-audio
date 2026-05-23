@@ -35,7 +35,7 @@ are part of the manifest and forwarded automatically.
 
 ```bash
 amc package add audio                                  # via index
-amc package add github.com/amalgame-lang/amalgame-audio@v0.3.0
+amc package add github.com/amalgame-lang/amalgame-audio@v0.4.0
 ```
 
 Requires **amc 0.5.4+** (precompile-on-install — miniaudio's
@@ -110,7 +110,7 @@ Audio.Play(buf, Audio.SampleRateOf("/tmp/whatever.mp3"))
 ```
 
 All loaders downmix to mono int16 — multi-channel pipelines are
-v0.4+. The `.o` produced from `ma_impl.c` grows from ~250 KB
+v0.5+. The `.o` produced from `ma_impl.c` grows from ~250 KB
 (WAV-only v0.1) to ~1 MB (v0.2 with MP3/FLAC/OGG enabled);
 acceptable for native multi-format playback without forking the
 package per codec.
@@ -149,6 +149,50 @@ The data callback runs on miniaudio's own OS thread but only does
 sidesteps the bdwgc thread-registration gotcha that would
 otherwise apply.
 
+### v0.4.0 additions — streaming playback (Pause / Resume / Stop)
+
+`Audio.Play(buf, sr)` holds the calling thread until the whole
+buffer has been pushed to the device — convenient for short cues,
+useless the moment you want to cancel mid-flight or layer other
+work on top. v0.4 adds a handle-based streaming surface symmetric
+to v0.3's capture trio.
+
+| Method | Returns | Notes |
+|---|---|---|
+| `Audio.PlayStart(samples, sampleRate)` | `AmalgameAudioPlay*` | Non-blocking; dups the buffer so the user can drop the list |
+| `Audio.PlayPause(handle)` | `bool` | Soft pause — callback writes silence, cursor freezes |
+| `Audio.PlayResume(handle)` | `bool` | Resume from the frozen cursor |
+| `Audio.PlayStop(handle)` | `bool` | Uninit device, free handle |
+| `Audio.PlayIsActive(handle)` | `bool` | False once the buffer drains naturally OR after `PlayStop` |
+| `Audio.PlayIsPaused(handle)` | `bool` | |
+| `Audio.PlaySampleCount(handle)` | `int` | Current read cursor — useful for progress bars |
+
+```amalgame
+// Play a tone, pause it after a beat, resume, stop early.
+let tone = Audio.ApplyEnvelope(Audio.GenSine(440.0, 2.0, 44100), 20.0, 20.0, 44100)
+let h    = Audio.PlayStart(tone, 44100)
+
+// ...do other work for ~500 ms...
+
+Audio.PlayPause(h)        // device keeps running, silence to speakers
+// ...wait, then resume mid-tone:
+Audio.PlayResume(h)
+// ...decide to cancel:
+Audio.PlayStop(h)         // uninit + free, h is dead after this
+```
+
+Pause is **soft**: the audio thread writes silence into the
+output buffer while the `paused` flag is set, rather than
+calling `ma_device_stop`. That avoids the audible pop you would
+otherwise get on stop/restart, and keeps resume cheap (one int
+toggle). The cost is a tiny amount of work still being done in
+the audio thread — fine for any realistic use case.
+
+`PlayStart` returns `null` if no default playback device can be
+opened (typical headless CI). On a developer box every member of
+the v0.4 surface returns `true`/non-null and the state-machine
+tests pass against the real output device.
+
 ### Sample format
 
 All v1 surface operates on **16-bit signed PCM mono samples**, with
@@ -156,7 +200,7 @@ each sample stored in AM as `int` (i64). Signed range `[-32768, 32767]`,
 zero = silence. Sample rate is passed as a separate argument
 (typical: 44100, 48000, 8000) and is not stored inside the buffer.
 
-Multi-channel + 32-bit float pipelines land in v0.4+.
+Multi-channel + 32-bit float pipelines land in v0.5+.
 
 ### Saving to a WAV file
 
@@ -182,12 +226,14 @@ amc -o submarine_ping submarine_ping.am
 aplay /tmp/submarine_ping.wav    # or open in any audio player
 ```
 
-## Deferred to v0.4+
+## Deferred to v0.5+
 
 - Real-time synth via user-provided callback (callbacks interact
   subtly with bdwgc thread pinning)
 - Pitch shift / time stretch / FFT analysis
-- Mixing graph / spatial audio / HRTF
+- Mixing graph / spatial audio / HRTF — a *live* mixer over the
+  v0.4 streaming surface, vs. the offline `Audio.Mix` buffer
+  composition already shipped in v0.1
 - Stereo and float32 sample formats
 
 ## Tests
@@ -196,12 +242,16 @@ aplay /tmp/submarine_ping.wav    # or open in any audio player
 ./tests/run_tests.sh /path/to/amc
 ```
 
-Tests are deterministic — synthesis is fully reproducible, WAV
-round-trip is lossless, `Audio.Play` is intentionally NOT in the
-test suite (silent CI machines have no usable output device).
-The v0.3 capture tests SKIP cleanly when no default input device
-is available (typical CI box) and otherwise exercise the real
-hardware path through `Record` / `RecordStart` / `RecordStop`.
+Tests are deterministic — synthesis is fully reproducible and WAV
+round-trip is lossless. The blocking `Audio.Play` is intentionally
+NOT in the test suite (a 100 ms cue would hang an unattended
+runner). The v0.3 capture tests and the v0.4 streaming-playback
+tests SKIP cleanly when no default input / output device is
+available (typical CI box) and otherwise exercise the real
+hardware path: `Record` / `RecordStart` / `RecordStop` for
+capture; the full `PlayStart` → `PlayPause` → `PlayResume` →
+`PlayStop` state machine against 1 s of silence for streaming
+(audible-free even on a real device).
 
 ## Licence
 
