@@ -61,12 +61,22 @@
  *   Audio.RecordIsActive(handle)          -> bool
  *   Audio.RecordSampleCount(handle)       -> int         peek progress
  *
+ *   ── v0.4 — streaming playback (Pause / Resume / Stop) ──
+ *   Audio.PlayStart(samples, sampleRate)  -> handle      non-blocking
+ *   Audio.PlayPause(handle)               -> bool        soft pause (silence)
+ *   Audio.PlayResume(handle)              -> bool
+ *   Audio.PlayStop(handle)                -> bool        uninit + free
+ *   Audio.PlayIsActive(handle)            -> bool        still streaming
+ *   Audio.PlayIsPaused(handle)            -> bool
+ *   Audio.PlaySampleCount(handle)         -> int         current cursor
+ *
  * Threading: synthesis / transformation are pure (return new
- * buffers). Play / Record are blocking single-threaded; one call
- * per thread. The capture data callback runs on miniaudio's own
- * thread but only writes to a pre-allocated C int16 buffer (no
- * GC interaction). Concurrent SaveAsWav/LoadWav calls against
- * distinct paths are safe.
+ * buffers). Blocking `Play` / `Record` hold the calling thread
+ * until the device drains / fills. Streaming `PlayStart` and
+ * non-blocking `RecordStart` return immediately; their data
+ * callbacks run on miniaudio's own thread but only touch a
+ * pre-allocated C int16 buffer (no GC interaction). Concurrent
+ * SaveAsWav/LoadWav calls against distinct paths are safe.
  *
  * Pixel-style note on samples: each sample is int16 stored as i64
  * (since AM's int = i64). We clip to [-32768, 32767] on every
@@ -816,5 +826,183 @@ static inline i64 Amalgame_Audio_RecordSampleCount(AmalgameAudioRec* ctx) {
     return (i64) ctx->pos;
 }
 
+/* ═══════════════════════════════════════════════════════
+ *  v0.4 — streaming playback (Pause / Resume / Stop)
+ * ═══════════════════════════════════════════════════════
+ *
+ * `Audio.Play(buf, sr)` blocks the caller until the whole buffer
+ * has been pushed to the device — fine for short cues, useless
+ * the moment you want to pause / cancel mid-flight or layer
+ * other work on top. v0.4 adds a handle-based streaming surface
+ * symmetric to v0.3's capture trio:
+ *
+ *   AmalgameAudioPlay* h = Audio.PlayStart(buf, sr)
+ *   Audio.PlayPause(h)         -> bool   (silence to device, pos frozen)
+ *   Audio.PlayResume(h)        -> bool   (back to streaming)
+ *   Audio.PlayStop(h)          -> bool   (uninit device, free handle)
+ *   Audio.PlayIsActive(h)      -> bool   (running && pos < n)
+ *   Audio.PlayIsPaused(h)      -> bool
+ *   Audio.PlaySampleCount(h)   -> int    (current write cursor)
+ *
+ * Pause is a soft pause — the data callback writes silence into
+ * the output frames while the `paused` flag is set, instead of
+ * `ma_device_stop`-ing the device. Reasons:
+ *
+ *   - No audible pop on pause/resume (the device keeps running).
+ *   - Reentry is cheap (toggle one int instead of teardown).
+ *   - Avoids the rare ALSA / WASAPI quirks around stop+restart.
+ *
+ * Same bdwgc-safe pattern as capture: the data callback only
+ * touches a pre-allocated C int16 buffer (a private copy of the
+ * user's samples — we dup at PlayStart so the user can drop /
+ * mutate their AmalgameList right after). Zero GC interaction
+ * from the audio thread.
+ */
+
+typedef struct AmalgameAudioPlay {
+    int16_t*       pcm;          /* owned copy of the source samples */
+    ma_uint64      n;            /* total samples in pcm */
+    ma_uint64      pos;          /* read cursor (advanced by callback) */
+    ma_device      dev;
+    int            dev_inited;   /* 1 once ma_device_init succeeded */
+    int            running;      /* 0 once pos hits n OR PlayStop ran */
+    int            paused;       /* set by PlayPause, cleared by PlayResume */
+} AmalgameAudioPlay;
+
+static void _amaudio_playstream_cb(ma_device* dev, void* output, const void* input, ma_uint32 frames) {
+    (void) input;
+    AmalgameAudioPlay* ctx = (AmalgameAudioPlay*) dev->pUserData;
+    int16_t* out = (int16_t*) output;
+    ma_uint64 want = (ma_uint64) frames;
+    if (!ctx || !ctx->running || ctx->paused) {
+        /* Silence: either we're done, stopped, or held paused.
+         * Keep the device running so resume is glitch-free. */
+        memset(out, 0, (size_t) want * sizeof(int16_t));
+        return;
+    }
+    ma_uint64 remaining = (ctx->n > ctx->pos) ? (ctx->n - ctx->pos) : 0;
+    ma_uint64 take = (want < remaining) ? want : remaining;
+    if (take > 0) {
+        memcpy(out, ctx->pcm + ctx->pos, (size_t) take * sizeof(int16_t));
+        ctx->pos += take;
+    }
+    if (take < want) {
+        memset(out + take, 0, (size_t) (want - take) * sizeof(int16_t));
+        ctx->running = 0;            /* buffer drained — natural end */
+    }
+}
+
+/* Start non-blocking playback. Dups the AmalgameList contents
+ * into a private int16 buffer so the user is free to mutate /
+ * drop their list right after. Returns NULL on device-open
+ * failure (LastError populated — typical headless CI:
+ * "no default playback device"). */
+static inline AmalgameAudioPlay* Amalgame_Audio_PlayStart(AmalgameList* samples, i64 sampleRate) {
+    if (!samples || sampleRate <= 0) {
+        _amaudio_set_error("PlayStart: null samples or bad sampleRate");
+        return NULL;
+    }
+    size_t n = 0;
+    int16_t* pcm = _amaudio_pcm_from_buf(samples, &n);
+    if (!pcm || n == 0) {
+        free(pcm);
+        _amaudio_set_error("PlayStart: empty buf");
+        return NULL;
+    }
+
+    AmalgameAudioPlay* ctx = (AmalgameAudioPlay*) calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        free(pcm);
+        _amaudio_set_error("PlayStart: OOM");
+        return NULL;
+    }
+    ctx->pcm     = pcm;
+    ctx->n       = (ma_uint64) n;
+    ctx->running = 1;
+
+    ma_device_config dcfg = ma_device_config_init(ma_device_type_playback);
+    dcfg.playback.format   = ma_format_s16;
+    dcfg.playback.channels = 1;
+    dcfg.sampleRate        = (ma_uint32) sampleRate;
+    dcfg.dataCallback      = _amaudio_playstream_cb;
+    dcfg.pUserData         = ctx;
+
+    if (ma_device_init(NULL, &dcfg, &ctx->dev) != MA_SUCCESS) {
+        free(ctx->pcm);
+        free(ctx);
+        _amaudio_set_error("PlayStart: device_init failed");
+        return NULL;
+    }
+    ctx->dev_inited = 1;
+
+    if (ma_device_start(&ctx->dev) != MA_SUCCESS) {
+        ma_device_uninit(&ctx->dev);
+        free(ctx->pcm);
+        free(ctx);
+        _amaudio_set_error("PlayStart: device_start failed");
+        return NULL;
+    }
+    _amaudio_set_error(NULL);
+    return ctx;
+}
+
+/* Soft pause — the data callback starts writing silence and the
+ * read cursor freezes. Device stays running, so PlayResume is
+ * pop-free. Safe to call multiple times; null handle is a no-op
+ * returning false. */
+static inline code_bool Amalgame_Audio_PlayPause(AmalgameAudioPlay* ctx) {
+    if (!ctx) { _amaudio_set_error("PlayPause: null handle"); return 0; }
+    ctx->paused = 1;
+    _amaudio_set_error(NULL);
+    return 1;
+}
+
+/* Clear the pause flag — callback resumes streaming from `pos`. */
+static inline code_bool Amalgame_Audio_PlayResume(AmalgameAudioPlay* ctx) {
+    if (!ctx) { _amaudio_set_error("PlayResume: null handle"); return 0; }
+    ctx->paused = 0;
+    _amaudio_set_error(NULL);
+    return 1;
+}
+
+/* Stop playback, uninit the device, free the handle. Safe to
+ * call once per handle; calling twice is a no-op returning
+ * false. After PlayStop the pointer is dead — don't pass it to
+ * any other Play* function. */
+static inline code_bool Amalgame_Audio_PlayStop(AmalgameAudioPlay* ctx) {
+    if (!ctx) { _amaudio_set_error("PlayStop: null handle"); return 0; }
+    ctx->running = 0;
+    if (ctx->dev_inited) {
+        ma_device_stop(&ctx->dev);
+        ma_device_uninit(&ctx->dev);
+        ctx->dev_inited = 0;
+    }
+    free(ctx->pcm);
+    free(ctx);
+    _amaudio_set_error(NULL);
+    return 1;
+}
+
+/* True iff the device is still streaming samples (i.e. PlayStop
+ * hasn't been called AND the buffer hasn't been fully drained).
+ * Returns false once the natural end-of-buffer is reached, even
+ * before the user calls PlayStop. */
+static inline code_bool Amalgame_Audio_PlayIsActive(AmalgameAudioPlay* ctx) {
+    if (!ctx) return 0;
+    return ctx->running ? 1 : 0;
+}
+
+static inline code_bool Amalgame_Audio_PlayIsPaused(AmalgameAudioPlay* ctx) {
+    if (!ctx) return 0;
+    return ctx->paused ? 1 : 0;
+}
+
+/* Current read cursor — how many samples have been pushed to
+ * the device so far. Useful for "progress bar" UI or for
+ * deciding when to layer another sound in. */
+static inline i64 Amalgame_Audio_PlaySampleCount(AmalgameAudioPlay* ctx) {
+    if (!ctx) return 0;
+    return (i64) ctx->pos;
+}
 
 #endif /* AMALGAME_AUDIO_H */

@@ -218,5 +218,65 @@ public class Program {
         } else {
             Console.WriteLine("[SKIP] RecordStart/Stop (no capture device)")
         }
+
+        // ═══════════════════════════════════════════════════════
+        //  v0.4 — streaming playback (Pause / Resume / Stop)
+        // ═══════════════════════════════════════════════════════
+        //
+        // Probe for a default playback device by starting a tiny
+        // silence stream. PlayStart returns null on headless CI
+        // machines (no default output device) — every downstream
+        // streaming assertion then SKIPs.
+        //
+        // We use 1 second of silence at 16 kHz so the buffer is
+        // long enough that PlayIsActive stays true while we run
+        // the state-machine assertions (PlayPause → PlayResume).
+
+        let silentBuf = Audio.GenSilence(1.0, 16000)
+        let probeH = Audio.PlayStart(silentBuf, 16000)
+        // AM lacks a syntax for "is this pointer null" on opaque
+        // handles — we lean on PlayIsActive which returns false
+        // when the handle is null AND when the buffer is drained.
+        // On a fresh PlayStart against a real device with 1 s of
+        // silence at 16 kHz, the cursor advances by at most a few
+        // hundred samples before this check fires, so active is
+        // true. On a headless box, PlayStart returns null and
+        // PlayIsActive yields false → SKIP.
+        let havePlayback: bool = Audio.PlayIsActive(probeH)
+
+        // ── 16. PlayStart on a real device leaves handle active ─
+        if (havePlayback) {
+            Console.WriteLine("[PASS] PlayStart returns active handle")
+        } else {
+            Console.WriteLine("[SKIP] PlayStart (no playback device)")
+        }
+
+        // ── 17. Pause → IsPaused true, Resume → IsPaused false ──
+        if (havePlayback) {
+            Audio.PlayPause(probeH)
+            let p1: bool = Audio.PlayIsPaused(probeH)
+            Audio.PlayResume(probeH)
+            let p2: bool = Audio.PlayIsPaused(probeH)
+            if (p1 && !p2) {
+                Console.WriteLine("[PASS] PlayPause/Resume toggles flag")
+            } else {
+                Console.WriteLine("[FAIL] PlayPause/Resume: p1="
+                    + String_FromInt(p1) + " p2=" + String_FromInt(p2))
+            }
+        } else {
+            Console.WriteLine("[SKIP] PlayPause/Resume (no playback device)")
+        }
+
+        // ── 18. PlayStop returns true + frees handle ──────────
+        if (havePlayback) {
+            let stopped: bool = Audio.PlayStop(probeH)
+            if (stopped) {
+                Console.WriteLine("[PASS] PlayStop returns true on live handle")
+            } else {
+                Console.WriteLine("[FAIL] PlayStop returned false")
+            }
+        } else {
+            Console.WriteLine("[SKIP] PlayStop (no playback device)")
+        }
     }
 }

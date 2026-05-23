@@ -74,7 +74,7 @@ echo ""
 # ── Stage a fake cache pointing at the working tree ──
 FAKE_CACHE="$BUILD_DIR/cache"
 PKG_GIT="github.com/amalgame-lang/amalgame-audio"
-PKG_TAG="${PKG_TAG:-v0.3.0}"
+PKG_TAG="${PKG_TAG:-v0.4.0}"
 FAKE_SHA="deadbeefcafebabe0000000000000000000000ab"
 SHORT_SHA="${FAKE_SHA:0:8}"
 PKG_CACHE_DIR="$FAKE_CACHE/$PKG_GIT/${PKG_TAG}_${SHORT_SHA}"
@@ -164,6 +164,17 @@ echo "── Audio v0.3 (capture) ───────────────�
 # they exercise both the blocking and non-blocking surfaces.
 run_test "Record blocking length"    "[PASS] Record blocking length"            "[SKIP] Record blocking"
 run_test "RecordStart/Stop trio"     "[PASS] RecordStart/Stop handle roundtrip" "[SKIP] RecordStart/Stop"
+
+echo ""
+echo "── Audio v0.4 (streaming playback) ─────────"
+# Same SKIP gating as capture — silent CI machines have no
+# default output device, so PlayStart returns null and these
+# tests SKIP cleanly. On a developer box they exercise the full
+# state machine (Start → IsActive → Pause → IsPaused → Resume →
+# IsPaused → Stop).
+run_test "PlayStart active handle"   "[PASS] PlayStart returns active handle"   "[SKIP] PlayStart"
+run_test "PlayPause/Resume toggle"   "[PASS] PlayPause/Resume toggles flag"     "[SKIP] PlayPause/Resume"
+run_test "PlayStop returns true"     "[PASS] PlayStop returns true on live handle" "[SKIP] PlayStop"
 
 echo ""
 echo "────────────────────────────────────────────"

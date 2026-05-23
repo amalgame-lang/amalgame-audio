@@ -15,7 +15,7 @@
 #   Diag:         LastError
 #
 # Sample format: 16-bit signed PCM mono. Multi-channel + 32-bit
-# float pipelines are v0.4+.
+# float pipelines are v0.5+.
 #
 # Surface (v0.2 additions):
 #   Multi-format load:  Load / LoadMp3 / LoadFlac / LoadOgg
@@ -25,23 +25,28 @@
 #   Capture:    Record (blocking) / RecordStart / RecordStop /
 #               RecordIsActive / RecordSampleCount
 #
-# Out of scope (v0.4+):
+# Surface (v0.4 additions):
+#   Streaming playback:  PlayStart / PlayPause / PlayResume /
+#                        PlayStop / PlayIsActive / PlayIsPaused /
+#                        PlaySampleCount
+#
+# Out of scope (v0.5+):
 #   - Real-time synthesis via user-provided callback
 #   - Pitch shift / time stretch / FFT analysis
 #   - Mixing graph / spatial audio / HRTF
-#   - Multi-channel pipelines (stereo / surround) — v0.3 keeps
+#   - Multi-channel pipelines (stereo / surround) — v0.4 keeps
 #     mono int16 as the canonical buffer type
 #
 # Installation:
 #
 #   amc package add audio                                # via index
-#   amc package add github.com/amalgame-lang/amalgame-audio@v0.3.0
+#   amc package add github.com/amalgame-lang/amalgame-audio@v0.4.0
 
 [package]
 name              = "amalgame-audio"
-version           = "0.3.0"
+version           = "0.4.0"
 license           = "Apache-2.0"
-description       = "Audio synth + playback + capture + multi-format decode (WAV/MP3/FLAC/OGG) for Amalgame — miniaudio (public domain), vendored."
+description       = "Audio synth + streaming playback + capture + multi-format decode (WAV/MP3/FLAC/OGG) for Amalgame — miniaudio (public domain), vendored."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.5.4"
 schema-version    = 1
@@ -97,5 +102,14 @@ RecordStart        = { returns = "AmalgameAudioRec*" }
 RecordStop         = { returns = "AmalgameList*" }
 RecordIsActive     = { returns = "code_bool" }
 RecordSampleCount  = { returns = "i64" }
+
+# v0.4 — streaming playback (Pause / Resume / Stop)
+PlayStart          = { returns = "AmalgameAudioPlay*" }
+PlayPause          = { returns = "code_bool" }
+PlayResume         = { returns = "code_bool" }
+PlayStop           = { returns = "code_bool" }
+PlayIsActive       = { returns = "code_bool" }
+PlayIsPaused       = { returns = "code_bool" }
+PlaySampleCount    = { returns = "i64" }
 
 [dependencies]
