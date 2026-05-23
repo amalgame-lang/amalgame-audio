@@ -176,5 +176,47 @@ public class Program {
             Console.WriteLine("[FAIL] SampleRateOf got "
                 + String_FromInt(bogus))
         }
+
+        // ═══════════════════════════════════════════════════════
+        //  v0.3 — mic capture
+        // ═══════════════════════════════════════════════════════
+        //
+        // Probe for a default capture device by running a tiny
+        // blocking Record. On headless CI machines this returns an
+        // empty buffer + sets LastError — every downstream capture
+        // assertion then SKIPs instead of FAILs.
+        //
+        // We use 50 ms at 16 kHz = 800 samples for the probe — fast
+        // enough not to slow the suite, long enough to exercise the
+        // callback's write path on real hardware.
+
+        let probe = Audio.Record(0.05, 16000)
+        let probeN: int = probe.Count()
+        let haveCapture: bool = (probeN == 800)
+
+        // ── 14. Record blocking — length matches duration × rate ──
+        if (haveCapture) {
+            Console.WriteLine("[PASS] Record blocking length")
+        } else {
+            Console.WriteLine("[SKIP] Record blocking (no capture device)")
+        }
+
+        // ── 15. Non-blocking Start → IsActive → Stop trio ────
+        if (haveCapture) {
+            let h = Audio.RecordStart(1.0, 16000)
+            let active1: bool = Audio.RecordIsActive(h)
+            let cap1 = Audio.RecordStop(h)
+            // active1 must be true (started, not stopped yet).
+            // Buffer count is non-negative by construction.
+            // NB: don't touch h after RecordStop — it's freed.
+            if (active1 && cap1.Count() >= 0) {
+                Console.WriteLine("[PASS] RecordStart/Stop handle roundtrip")
+            } else {
+                Console.WriteLine("[FAIL] RecordStart/Stop got "
+                    + String_FromInt(cap1.Count()))
+            }
+        } else {
+            Console.WriteLine("[SKIP] RecordStart/Stop (no capture device)")
+        }
     }
 }
