@@ -74,7 +74,7 @@ echo ""
 # ── Stage a fake cache pointing at the working tree ──
 FAKE_CACHE="$BUILD_DIR/cache"
 PKG_GIT="github.com/amalgame-lang/amalgame-audio"
-PKG_TAG="${PKG_TAG:-v0.2.0}"
+PKG_TAG="${PKG_TAG:-v0.3.0}"
 FAKE_SHA="deadbeefcafebabe0000000000000000000000ab"
 SHORT_SHA="${FAKE_SHA:0:8}"
 PKG_CACHE_DIR="$FAKE_CACHE/$PKG_GIT/${PKG_TAG}_${SHORT_SHA}"
@@ -98,6 +98,7 @@ echo ""
 run_test() {
     local name="$1"
     local expected="$2"
+    local skip_marker="${3:-}"
     printf "  %-38s" "$name"
     cp "$SCRIPT_DIR/stdlib_audio.am" "$PROJ_DIR/test.am"
     local out_base="$PROJ_DIR/test"
@@ -125,6 +126,9 @@ run_test() {
     run_output=$("$out_base" 2>&1)
     if echo "$run_output" | grep -qF "$expected"; then
         echo -e "${GREEN}PASS${NC}"; PASS=$((PASS + 1))
+    elif [ -n "$skip_marker" ] && echo "$run_output" | grep -qF "$skip_marker"; then
+        echo -e "${YELLOW}SKIP${NC} (no capture device)"
+        SKIP=$((SKIP + 1))
     else
         echo -e "${RED}FAIL${NC}"
         echo "    expected: $expected"
@@ -152,6 +156,14 @@ run_test "ChannelCountOf mono"   "[PASS] ChannelCountOf returns 1 for mono WAV"
 run_test "DurationMsOf 100ms"    "[PASS] DurationMsOf returns 100 for 0.1s sine"
 run_test "Load auto-detect"      "[PASS] Load auto-detects WAV"
 run_test "Probe missing file"    "[PASS] SampleRateOf rejects missing file"
+
+echo ""
+echo "── Audio v0.3 (capture) ────────────────────"
+# These tests SKIP cleanly when no default capture device is
+# available (typical CI). On a developer box with a working mic
+# they exercise both the blocking and non-blocking surfaces.
+run_test "Record blocking length"    "[PASS] Record blocking length"            "[SKIP] Record blocking"
+run_test "RecordStart/Stop trio"     "[PASS] RecordStart/Stop handle roundtrip" "[SKIP] RecordStart/Stop"
 
 echo ""
 echo "────────────────────────────────────────────"

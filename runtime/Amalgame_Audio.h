@@ -54,10 +54,19 @@
  *   Audio.ChannelCountOf(path)    -> int (1 = mono, 2 = stereo, …)
  *   Audio.DurationMsOf(path)      -> int (milliseconds)
  *
+ *   ── v0.3 — mic capture ──
+ *   Audio.Record(durSec, sampleRate)      -> List<int>   blocking
+ *   Audio.RecordStart(maxSec, sampleRate) -> handle      non-blocking
+ *   Audio.RecordStop(handle)              -> List<int>   drain + free
+ *   Audio.RecordIsActive(handle)          -> bool
+ *   Audio.RecordSampleCount(handle)       -> int         peek progress
+ *
  * Threading: synthesis / transformation are pure (return new
- * buffers). Play is blocking single-threaded; one Play call per
- * thread. Concurrent SaveAsWav/LoadWav calls against distinct
- * paths are safe.
+ * buffers). Play / Record are blocking single-threaded; one call
+ * per thread. The capture data callback runs on miniaudio's own
+ * thread but only writes to a pre-allocated C int16 buffer (no
+ * GC interaction). Concurrent SaveAsWav/LoadWav calls against
+ * distinct paths are safe.
  *
  * Pixel-style note on samples: each sample is int16 stored as i64
  * (since AM's int = i64). We clip to [-32768, 32767] on every
@@ -601,5 +610,211 @@ static inline i64 Amalgame_Audio_DurationMsOf(code_string path) {
     if (rate <= 0) return 0;
     return (i64) ((frames * 1000) / (ma_uint64) rate);
 }
+
+/* ═══════════════════════════════════════════════════════
+ *  v0.3 — mic capture
+ * ═══════════════════════════════════════════════════════
+ *
+ * Two surfaces:
+ *   • Blocking — `Record(durSec, sampleRate)` returns a List<int>
+ *     of int16 mono samples after recording for exactly durSec
+ *     seconds. Symmetric to Play.
+ *   • Non-blocking — `RecordStart` returns an opaque handle, the
+ *     audio thread keeps appending to a pre-allocated int16 ring
+ *     (actually a flat buffer with hard cap maxSec * sampleRate),
+ *     `RecordStop` returns the captured List<int> and frees the
+ *     handle. `RecordIsActive` peeks at the handle's run flag.
+ *
+ * Why the C-side int16 buffer (instead of writing directly into an
+ * AmalgameList from the data callback)?
+ *
+ *   miniaudio drives the capture callback on its own OS thread.
+ *   bdwgc (Boehm GC) only scans threads it has been told about —
+ *   AmalgameList allocations from an un-registered thread would
+ *   race the collector. Keeping the callback to pure
+ *   memcpy/atomic-store against a pre-allocated C buffer
+ *   sidesteps the issue entirely; the AmalgameList is built on
+ *   the main (registered) thread after the device is uninit'd.
+ *
+ * Format is the same canonical contract as the rest of v0.1/v0.2:
+ * 16-bit signed PCM mono. miniaudio downmixes whatever the
+ * default input device produces.
+ */
+
+/* Opaque handle — `AmalgameAudioRec*` is what AM-side code sees,
+ * the underlying struct stays implementation-private.
+ *
+ * `full` is signalled by the data callback once the pre-allocated
+ * buffer is exhausted — the blocking `Record` waits on it. The
+ * non-blocking trio (`RecordStart` / `RecordStop`) ignores it and
+ * just lets the cursor advance until the user calls Stop, but the
+ * field is initialised either way so cleanup paths are uniform.
+ */
+typedef struct AmalgameAudioRec {
+    int16_t*       pcm;          /* pre-allocated cap * sizeof(int16_t) */
+    ma_uint64      cap;          /* hard ceiling, in samples */
+    ma_uint64      pos;          /* atomic-ish write cursor */
+    ma_device      dev;
+    ma_event       full;         /* signalled when pos reaches cap */
+    int            dev_inited;   /* 1 once ma_device_init succeeded */
+    int            evt_inited;   /* 1 once ma_event_init succeeded */
+    int            running;      /* set 0 by RecordStop to drain the cb */
+} AmalgameAudioRec;
+
+static void _amaudio_record_cb(ma_device* dev, void* output, const void* input, ma_uint32 frames) {
+    (void) output;
+    AmalgameAudioRec* ctx = (AmalgameAudioRec*) dev->pUserData;
+    if (!ctx || !ctx->running) return;
+    ma_uint64 room = (ctx->cap > ctx->pos) ? (ctx->cap - ctx->pos) : 0;
+    ma_uint64 take = (frames < room) ? (ma_uint64) frames : room;
+    if (take > 0) {
+        memcpy(ctx->pcm + ctx->pos, input, (size_t) take * sizeof(int16_t));
+        ctx->pos += take;
+    }
+    if (ctx->pos >= ctx->cap) {
+        ctx->running = 0;        /* buffer full */
+        if (ctx->evt_inited) ma_event_signal(&ctx->full);
+    }
+}
+
+/* Open the default capture device into ctx. Returns 1 on success,
+ * 0 on failure (LastError carries the reason). Caller still owns
+ * ctx->pcm — on failure we leave it as-is so the caller can free. */
+static inline int _amaudio_rec_open(AmalgameAudioRec* ctx, i64 sampleRate, const char* verb) {
+    ma_device_config dcfg = ma_device_config_init(ma_device_type_capture);
+    dcfg.capture.format   = ma_format_s16;
+    dcfg.capture.channels = 1;
+    dcfg.sampleRate       = (ma_uint32) sampleRate;
+    dcfg.dataCallback     = _amaudio_record_cb;
+    dcfg.pUserData        = ctx;
+    if (ma_device_init(NULL, &dcfg, &ctx->dev) != MA_SUCCESS) {
+        _amaudio_set_error(verb);
+        return 0;
+    }
+    ctx->dev_inited = 1;
+    if (ma_device_start(&ctx->dev) != MA_SUCCESS) {
+        ma_device_uninit(&ctx->dev);
+        ctx->dev_inited = 0;
+        _amaudio_set_error(verb);
+        return 0;
+    }
+    return 1;
+}
+
+/* Blocking mic capture for `durSec` seconds at `sampleRate` Hz.
+ * Returns a List<int> of int16 mono samples (length = durSec * sr).
+ * On device-open failure returns an empty list — LastError tells
+ * the user what went wrong (typical CI: "no default capture
+ * device"). */
+static inline AmalgameList* Amalgame_Audio_Record(f64 durSec, i64 sampleRate) {
+    if (durSec <= 0.0 || sampleRate <= 0) {
+        _amaudio_set_error("Record: durSec and sampleRate must be > 0");
+        return AmalgameList_new();
+    }
+    ma_uint64 want = (ma_uint64) (durSec * (f64) sampleRate);
+    if (want == 0) return AmalgameList_new();
+
+    AmalgameAudioRec ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.pcm = (int16_t*) malloc((size_t) want * sizeof(int16_t));
+    if (!ctx.pcm) { _amaudio_set_error("Record: OOM"); return AmalgameList_new(); }
+    ctx.cap     = want;
+    ctx.running = 1;
+
+    if (ma_event_init(&ctx.full) != MA_SUCCESS) {
+        free(ctx.pcm);
+        _amaudio_set_error("Record: event_init failed");
+        return AmalgameList_new();
+    }
+    ctx.evt_inited = 1;
+
+    if (!_amaudio_rec_open(&ctx, sampleRate, "Record: device_init/start failed")) {
+        ma_event_uninit(&ctx.full);
+        free(ctx.pcm);
+        return AmalgameList_new();
+    }
+
+    /* Block until the callback signals the buffer is full. The
+     * data callback fires on miniaudio's audio thread, signals
+     * `full` once `pos >= cap`, then this thread proceeds. */
+    ma_event_wait(&ctx.full);
+
+    ma_device_stop(&ctx.dev);
+    ma_device_uninit(&ctx.dev);
+    ma_event_uninit(&ctx.full);
+    AmalgameList* out = _amaudio_buf_from_pcm(ctx.pcm, (size_t) ctx.pos);
+    free(ctx.pcm);
+    _amaudio_set_error(NULL);
+    return out;
+}
+
+/* Start non-blocking capture. Pre-allocates a maxSec ceiling
+ * (the callback never writes past it). Returns an opaque
+ * handle as void*; pass it to RecordStop / RecordIsActive.
+ * Returns NULL on failure (LastError populated). */
+static inline AmalgameAudioRec* Amalgame_Audio_RecordStart(f64 maxSec, i64 sampleRate) {
+    if (maxSec <= 0.0 || sampleRate <= 0) {
+        _amaudio_set_error("RecordStart: maxSec and sampleRate must be > 0");
+        return NULL;
+    }
+    ma_uint64 cap = (ma_uint64) (maxSec * (f64) sampleRate);
+    if (cap == 0) {
+        _amaudio_set_error("RecordStart: maxSec too short");
+        return NULL;
+    }
+    AmalgameAudioRec* ctx = (AmalgameAudioRec*) calloc(1, sizeof(*ctx));
+    if (!ctx) { _amaudio_set_error("RecordStart: OOM"); return NULL; }
+    ctx->pcm = (int16_t*) malloc((size_t) cap * sizeof(int16_t));
+    if (!ctx->pcm) {
+        free(ctx);
+        _amaudio_set_error("RecordStart: OOM");
+        return NULL;
+    }
+    ctx->cap     = cap;
+    ctx->running = 1;
+
+    if (!_amaudio_rec_open(ctx, sampleRate, "RecordStart: device_init/start failed")) {
+        free(ctx->pcm);
+        free(ctx);
+        return NULL;
+    }
+    _amaudio_set_error(NULL);
+    return ctx;
+}
+
+/* Stop a non-blocking capture, drain the buffer into a
+ * List<int>, and free the handle. Safe to call once per
+ * handle; passing the same handle twice is a no-op returning
+ * an empty list. */
+static inline AmalgameList* Amalgame_Audio_RecordStop(AmalgameAudioRec* ctx) {
+    if (!ctx) { _amaudio_set_error("RecordStop: null handle"); return AmalgameList_new(); }
+    ctx->running = 0;
+    if (ctx->dev_inited) {
+        ma_device_stop(&ctx->dev);
+        ma_device_uninit(&ctx->dev);
+        ctx->dev_inited = 0;
+    }
+    AmalgameList* out = _amaudio_buf_from_pcm(ctx->pcm, (size_t) ctx->pos);
+    free(ctx->pcm);
+    free(ctx);
+    _amaudio_set_error(NULL);
+    return out;
+}
+
+/* True iff the capture device is still actively pulling samples
+ * (i.e. RecordStop hasn't been called and the buffer hasn't
+ * filled). Useful to poll from the AM side between work items. */
+static inline code_bool Amalgame_Audio_RecordIsActive(AmalgameAudioRec* ctx) {
+    if (!ctx) return 0;
+    return ctx->running ? 1 : 0;
+}
+
+/* Returns how many samples have been captured so far on a live
+ * handle (or post-mortem if you peek before RecordStop). */
+static inline i64 Amalgame_Audio_RecordSampleCount(AmalgameAudioRec* ctx) {
+    if (!ctx) return 0;
+    return (i64) ctx->pos;
+}
+
 
 #endif /* AMALGAME_AUDIO_H */

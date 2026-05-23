@@ -1,6 +1,6 @@
 # amalgame-audio
 
-Audio synthesis, playback and WAV IO for [Amalgame](https://github.com/amalgame-lang/Amalgame).
+Audio synthesis, playback, capture and multi-format decode for [Amalgame](https://github.com/amalgame-lang/Amalgame).
 Wraps David Reid's public-domain [miniaudio](https://github.com/mackron/miniaudio)
 single-header library (vendored at `runtime/vendor/`). miniaudio
 abstracts the OS-native audio APIs (WASAPI on Windows, Core Audio
@@ -35,7 +35,7 @@ are part of the manifest and forwarded automatically.
 
 ```bash
 amc package add audio                                  # via index
-amc package add github.com/amalgame-lang/amalgame-audio@v0.2.0
+amc package add github.com/amalgame-lang/amalgame-audio@v0.3.0
 ```
 
 Requires **amc 0.5.4+** (precompile-on-install — miniaudio's
@@ -110,10 +110,44 @@ Audio.Play(buf, Audio.SampleRateOf("/tmp/whatever.mp3"))
 ```
 
 All loaders downmix to mono int16 — multi-channel pipelines are
-v0.3+. The `.o` produced from `ma_impl.c` grows from ~250 KB
+v0.4+. The `.o` produced from `ma_impl.c` grows from ~250 KB
 (WAV-only v0.1) to ~1 MB (v0.2 with MP3/FLAC/OGG enabled);
 acceptable for native multi-format playback without forking the
 package per codec.
+
+### v0.3.0 additions — mic capture
+
+| Method | Returns | Notes |
+|---|---|---|
+| `Audio.Record(durSec, sampleRate)` | `List<int>` | Blocking capture for exactly `durSec` seconds |
+| `Audio.RecordStart(maxSec, sampleRate)` | `AmalgameAudioRec*` | Non-blocking; pre-allocates a `maxSec` ceiling |
+| `Audio.RecordStop(handle)` | `List<int>` | Drain the captured samples, free the handle |
+| `Audio.RecordIsActive(handle)` | `bool` | True while the device is still pulling samples |
+| `Audio.RecordSampleCount(handle)` | `int` | Peek at the current write cursor |
+
+```amalgame
+// Blocking: record exactly 2 seconds, then echo and save back.
+let raw     = Audio.Record(2.0, 16000)
+let echoed  = Audio.Echo(raw, 250.0, 0.4, 3, 16000)
+Audio.SaveAsWav(echoed, 16000, "echo.wav")
+
+// Non-blocking: start, do other work, stop when ready.
+let h = Audio.RecordStart(10.0, 16000)   // ceiling 10s
+while (Audio.RecordSampleCount(h) < 16000) {
+    // ...do other work for ~1s worth of audio...
+}
+let buf = Audio.RecordStop(h)            // freezes + frees h
+```
+
+Capture format matches the rest of the API — 16-bit signed PCM
+mono. Whatever the default input device reports is downmixed by
+miniaudio. On a headless machine without any capture device,
+`Record` returns an empty list and populates `Audio.LastError()`.
+
+The data callback runs on miniaudio's own OS thread but only does
+`memcpy` into a pre-allocated C buffer — no GC interaction, so it
+sidesteps the bdwgc thread-registration gotcha that would
+otherwise apply.
 
 ### Sample format
 
@@ -122,7 +156,7 @@ each sample stored in AM as `int` (i64). Signed range `[-32768, 32767]`,
 zero = silence. Sample rate is passed as a separate argument
 (typical: 44100, 48000, 8000) and is not stored inside the buffer.
 
-Multi-channel + 32-bit float pipelines land in v2.
+Multi-channel + 32-bit float pipelines land in v0.4+.
 
 ### Saving to a WAV file
 
@@ -148,9 +182,8 @@ amc -o submarine_ping submarine_ping.am
 aplay /tmp/submarine_ping.wav    # or open in any audio player
 ```
 
-## Deferred to v0.3+
+## Deferred to v0.4+
 
-- Capture (mic input) — needs the dual-callback shape
 - Real-time synth via user-provided callback (callbacks interact
   subtly with bdwgc thread pinning)
 - Pitch shift / time stretch / FFT analysis
@@ -166,6 +199,9 @@ aplay /tmp/submarine_ping.wav    # or open in any audio player
 Tests are deterministic — synthesis is fully reproducible, WAV
 round-trip is lossless, `Audio.Play` is intentionally NOT in the
 test suite (silent CI machines have no usable output device).
+The v0.3 capture tests SKIP cleanly when no default input device
+is available (typical CI box) and otherwise exercise the real
+hardware path through `Record` / `RecordStart` / `RecordStop`.
 
 ## Licence
 
