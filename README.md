@@ -35,7 +35,7 @@ are part of the manifest and forwarded automatically.
 
 ```bash
 amc package add audio                                  # via index
-amc package add github.com/amalgame-lang/amalgame-audio@v0.4.0
+amc package add github.com/amalgame-lang/amalgame-audio@v0.5.0
 ```
 
 Requires **amc 0.5.4+** (precompile-on-install — miniaudio's
@@ -193,6 +193,60 @@ opened (typical headless CI). On a developer box every member of
 the v0.4 surface returns `true`/non-null and the state-machine
 tests pass against the real output device.
 
+### v0.5.0 additions — live AudioMixer (multi-source streaming)
+
+`Audio.Mix(a, b, offset)` (v0.1) composes two buffers offline
+into a new buffer; `Audio.PlayStart(buf, sr)` (v0.4) streams one
+buffer to the device. Neither lets you start a sound, then start
+another *on top of it*, then stop the first while the second
+keeps playing. That's what a live mixer is for, and it's the
+last item from the original v1 audio surface.
+
+| Method | Returns | Notes |
+|---|---|---|
+| `Audio.MixerStart(sampleRate)` | `AmalgameAudioMixer*` | Open default-output device + empty mixer |
+| `Audio.MixerAddSource(mixer, samples, gain, loop)` | `int` voice id | Dups buffer; returns 0 on failure (mixer full / OOM) |
+| `Audio.MixerSetGain(mixer, voiceId, gain)` | `bool` | Per-voice volume; 0..1 attenuates, >1 boosts (clips) |
+| `Audio.MixerSetPaused(mixer, voiceId, paused)` | `bool` | Voice plays silence; cursor frozen |
+| `Audio.MixerRemoveSource(mixer, voiceId)` | `bool` | Frees the voice's buffer immediately |
+| `Audio.MixerSourceCount(mixer)` | `int` | Alive voices (drained ones auto-prune) |
+| `Audio.MixerStop(mixer)` | `bool` | Uninit device, free every voice, free mixer |
+
+```amalgame
+// Layered background music + sound effects.
+let bg  = Audio.LoadOgg("ambient.ogg")
+let sfx = Audio.GenSine(880.0, 0.2, 44100)
+let m   = Audio.MixerStart(44100)
+
+let bgId = Audio.MixerAddSource(m, bg, 0.6, true)   // loop the bg
+// ...later, fire a quick effect on top:
+let fxId = Audio.MixerAddSource(m, sfx, 1.0, false) // one-shot
+// ...turn down the music for a moment:
+Audio.MixerSetGain(m, bgId, 0.2)
+// ...restore:
+Audio.MixerSetGain(m, bgId, 0.6)
+// ...done:
+Audio.MixerStop(m)
+```
+
+**Capacity** is hard-capped at 32 voices. Plenty for game audio /
+interactive demos; orchestral mockups that need more are a v0.6+
+ask. A dynamic linked list with malloc-in-callback would be
+worse than a 32-slot scan + `in_use` check.
+
+**Concurrency**: a `ma_mutex` protects the voices array. The audio
+thread holds it for one device-tick worth of mixing (~256-1024
+samples), the main thread holds it briefly to mutate. Contention
+is negligible.
+
+**Voice IDs are monotonic** — never reused after a voice drains
+or is removed. A stale id always cleanly returns "not found"
+instead of accidentally hitting a recycled slot.
+
+**Auto-prune**: a non-looping voice whose cursor reaches `n` is
+removed from the active set inside the audio callback. The slot
+becomes available for future `AddSource` calls.
+
 ### Sample format
 
 All v1 surface operates on **16-bit signed PCM mono samples**, with
@@ -200,7 +254,7 @@ each sample stored in AM as `int` (i64). Signed range `[-32768, 32767]`,
 zero = silence. Sample rate is passed as a separate argument
 (typical: 44100, 48000, 8000) and is not stored inside the buffer.
 
-Multi-channel + 32-bit float pipelines land in v0.5+.
+Multi-channel + 32-bit float pipelines land in v0.6+.
 
 ### Saving to a WAV file
 
@@ -226,14 +280,13 @@ amc -o submarine_ping submarine_ping.am
 aplay /tmp/submarine_ping.wav    # or open in any audio player
 ```
 
-## Deferred to v0.5+
+## Deferred to v0.6+
 
+- MIDI in/out (SMF file IO + device IO via cross-platform wrapper) — coming in v0.6
 - Real-time synth via user-provided callback (callbacks interact
   subtly with bdwgc thread pinning)
 - Pitch shift / time stretch / FFT analysis
-- Mixing graph / spatial audio / HRTF — a *live* mixer over the
-  v0.4 streaming surface, vs. the offline `Audio.Mix` buffer
-  composition already shipped in v0.1
+- Spatial audio / HRTF / panning — the v0.5 mixer is mono summing only
 - Stereo and float32 sample formats
 
 ## Tests
@@ -245,13 +298,16 @@ aplay /tmp/submarine_ping.wav    # or open in any audio player
 Tests are deterministic — synthesis is fully reproducible and WAV
 round-trip is lossless. The blocking `Audio.Play` is intentionally
 NOT in the test suite (a 100 ms cue would hang an unattended
-runner). The v0.3 capture tests and the v0.4 streaming-playback
-tests SKIP cleanly when no default input / output device is
-available (typical CI box) and otherwise exercise the real
+runner). The v0.3 capture, v0.4 streaming-playback and v0.5
+mixer tests SKIP cleanly when no default input / output device
+is available (typical CI box) and otherwise exercise the real
 hardware path: `Record` / `RecordStart` / `RecordStop` for
 capture; the full `PlayStart` → `PlayPause` → `PlayResume` →
-`PlayStop` state machine against 1 s of silence for streaming
-(audible-free even on a real device).
+`PlayStop` state machine for streaming; and the `MixerStart` →
+`MixerAddSource × 2` → `SetGain` / `SetPaused` → `RemoveSource`
+→ `MixerStop` flow against two real sine tones for the live
+mixer (audible-free against a developer machine — the tones
+play during the run but the test is state-machine, not audio).
 
 ## Licence
 
