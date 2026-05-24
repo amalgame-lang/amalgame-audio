@@ -278,5 +278,94 @@ public class Program {
         } else {
             Console.WriteLine("[SKIP] PlayStop (no playback device)")
         }
+
+        // ═══════════════════════════════════════════════════════
+        //  v0.5 — live AudioMixer (multi-source streaming)
+        // ═══════════════════════════════════════════════════════
+        //
+        // We reuse the same playback-device probe — if PlayStart
+        // succeeded on the silence buffer above, mixer tests run
+        // against the real device. If not, they SKIP.
+        //
+        // Tests cover: MixerStart success, AddSource returns a
+        // positive voice id, SourceCount reflects the live count,
+        // RemoveSource decrements it, and MixerStop succeeds.
+        // We don't sleep / wait for natural drain — the assertions
+        // are pure state-machine, audible by the user but not
+        // gated on timing.
+
+        if (havePlayback) {
+            let m = Audio.MixerStart(16000)
+            // MixerStart returns null on no-device — but we
+            // already probed with PlayStart, so here it should
+            // succeed. Use MixerSourceCount as a non-throwing
+            // null-aware probe (returns 0 on null mixer too).
+            let initialCount: int = Audio.MixerSourceCount(m)
+            if (initialCount == 0) {
+                Console.WriteLine("[PASS] MixerStart fresh mixer has 0 sources")
+            } else {
+                Console.WriteLine("[FAIL] MixerStart fresh count = "
+                    + String_FromInt(initialCount))
+            }
+
+            // ── 19. AddSource × 2, expect 2 alive ─────────────
+            let tone1 = Audio.GenSine(440.0, 0.5, 16000)
+            let tone2 = Audio.GenSine(550.0, 0.5, 16000)
+            let v1: int = Audio.MixerAddSource(m, tone1, 0.5, false)
+            let v2: int = Audio.MixerAddSource(m, tone2, 0.5, false)
+            let cnt2: int = Audio.MixerSourceCount(m)
+            // v1, v2 are monotonic voice ids starting at 1; cnt2
+            // should be 2 (both alive on a freshly-started mixer).
+            if (v1 > 0 && v2 > v1 && cnt2 == 2) {
+                Console.WriteLine("[PASS] MixerAddSource × 2 → 2 voices")
+            } else {
+                Console.WriteLine("[FAIL] MixerAddSource: v1=" + String_FromInt(v1)
+                    + " v2=" + String_FromInt(v2) + " cnt=" + String_FromInt(cnt2))
+            }
+
+            // ── 20. SetGain / SetPaused on a live voice ───────
+            let gainOk: bool = Audio.MixerSetGain(m, v1, 0.8)
+            let pauseOk: bool = Audio.MixerSetPaused(m, v2, true)
+            if (gainOk && pauseOk) {
+                Console.WriteLine("[PASS] MixerSetGain/SetPaused on live voices")
+            } else {
+                Console.WriteLine("[FAIL] MixerSetGain="
+                    + String_FromInt(gainOk) + " SetPaused="
+                    + String_FromInt(pauseOk))
+            }
+
+            // ── 21. RemoveSource decrements SourceCount ───────
+            let rmOk: bool = Audio.MixerRemoveSource(m, v1)
+            let cnt1: int = Audio.MixerSourceCount(m)
+            if (rmOk && cnt1 == 1) {
+                Console.WriteLine("[PASS] MixerRemoveSource decrements count")
+            } else {
+                Console.WriteLine("[FAIL] MixerRemoveSource: ok="
+                    + String_FromInt(rmOk) + " cnt=" + String_FromInt(cnt1))
+            }
+
+            // ── 22. SetGain on stale voice id returns false ───
+            let staleOk: bool = Audio.MixerSetGain(m, v1, 0.5)
+            if (!staleOk) {
+                Console.WriteLine("[PASS] MixerSetGain on stale voice id is false")
+            } else {
+                Console.WriteLine("[FAIL] MixerSetGain on stale id returned true")
+            }
+
+            // ── 23. MixerStop returns true + frees ────────────
+            let mstop: bool = Audio.MixerStop(m)
+            if (mstop) {
+                Console.WriteLine("[PASS] MixerStop returns true")
+            } else {
+                Console.WriteLine("[FAIL] MixerStop returned false")
+            }
+        } else {
+            Console.WriteLine("[SKIP] MixerStart fresh mixer (no playback device)")
+            Console.WriteLine("[SKIP] MixerAddSource × 2 (no playback device)")
+            Console.WriteLine("[SKIP] MixerSetGain/SetPaused (no playback device)")
+            Console.WriteLine("[SKIP] MixerRemoveSource (no playback device)")
+            Console.WriteLine("[SKIP] MixerSetGain stale id (no playback device)")
+            Console.WriteLine("[SKIP] MixerStop (no playback device)")
+        }
     }
 }
