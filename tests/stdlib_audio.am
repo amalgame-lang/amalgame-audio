@@ -367,5 +367,144 @@ public class Program {
             Console.WriteLine("[SKIP] MixerSetGain stale id (no playback device)")
             Console.WriteLine("[SKIP] MixerStop (no playback device)")
         }
+
+        // ═══════════════════════════════════════════════════════
+        //  v0.6 — MIDI (SMF IO + render-to-audio)
+        // ═══════════════════════════════════════════════════════
+        //
+        // MIDI tests don't touch any device, so they run on every
+        // machine (no SKIP gating needed). We build a small event
+        // stream in-memory, save as SMF, load it back, verify the
+        // round-trip preserves structure, then render to audio.
+
+        // ── 24. SaveSmf produces a valid file ────────────────
+        // Build a tiny stream: middle C (note 60) at velocity 100
+        // for one quarter (480 ticks), then E (note 64), then G
+        // (note 67) — a C-major arpeggio over 1.44 s at 120 BPM.
+        // Packed as quads (delta, status, data1, data2):
+        // MIDI status bytes as decimal (AM has no hex literals):
+        //   144 = 0x90 = NoteOn  channel 0
+        //   128 = 0x80 = NoteOff channel 0
+        //   255 = 0xFF = Meta-event
+        //    81 = 0x51 = SetTempo meta-type
+        let evs = new List<int>()
+        // NoteOn C, delta=0
+        evs.Add(0); evs.Add(144); evs.Add(60); evs.Add(100)
+        // NoteOff C, delta=480 (1 quarter)
+        evs.Add(480); evs.Add(128); evs.Add(60); evs.Add(0)
+        // NoteOn E, delta=0
+        evs.Add(0); evs.Add(144); evs.Add(64); evs.Add(100)
+        // NoteOff E
+        evs.Add(480); evs.Add(128); evs.Add(64); evs.Add(0)
+        // NoteOn G
+        evs.Add(0); evs.Add(144); evs.Add(67); evs.Add(100)
+        // NoteOff G
+        evs.Add(480); evs.Add(128); evs.Add(67); evs.Add(0)
+
+        let smfPath: string = "/tmp/amc_audio_test.mid"
+        let savedSmf: bool = Audio.MidiSaveSmf(smfPath, evs, 480, 500000)
+        if (savedSmf) {
+            Console.WriteLine("[PASS] MidiSaveSmf round-trip writer")
+        } else {
+            Console.WriteLine("[FAIL] MidiSaveSmf: " + Audio.LastError())
+        }
+
+        // ── 25. LoadSmf reads back the same event count ──────
+        let backEvs = Audio.MidiLoadSmf(smfPath)
+        // We wrote 6 events × 4 ints = 24 quads. The loader
+        // returns the same event stream — no extra events except
+        // the tempo meta we prepended on save (which becomes the
+        // first quad with status=0xFF, data1=0x51).
+        // So expected count = 24 (our events) + 4 (the tempo
+        // meta) = 28.
+        if (backEvs.Count() == 28) {
+            Console.WriteLine("[PASS] MidiLoadSmf 28 ints (6 notes + tempo meta)")
+        } else {
+            Console.WriteLine("[FAIL] MidiLoadSmf got " + String_FromInt(backEvs.Count())
+                + " ints (expected 28)")
+        }
+
+        // ── 26. MidiLastTempo + TicksPerQuarter ──────────────
+        let tpqBack: int = Audio.MidiLastTicksPerQuarter()
+        let tempoBack: int = Audio.MidiLastTempo()
+        if (tpqBack == 480 && tempoBack == 500000) {
+            Console.WriteLine("[PASS] MidiLast* sondes return saved values")
+        } else {
+            Console.WriteLine("[FAIL] MidiLast*: tpq=" + String_FromInt(tpqBack)
+                + " tempo=" + String_FromInt(tempoBack))
+        }
+
+        // ── 27. First quad of loaded events is the tempo meta ─
+        // Layout: status at offset 1 should be 0xFF (255).
+        let firstStatus: int = backEvs.Get(1)
+        let firstD1: int = backEvs.Get(2)
+        let firstD2: int = backEvs.Get(3)
+        if (firstStatus == 255 && firstD1 == 81 && firstD2 == 500000) {
+            Console.WriteLine("[PASS] First event is tempo meta (FF 51 500000)")
+        } else {
+            Console.WriteLine("[FAIL] First event: " + String_FromInt(firstStatus)
+                + " " + String_FromInt(firstD1) + " " + String_FromInt(firstD2))
+        }
+
+        // ── 28. RenderToAudio produces non-empty mono int16 buffer ─
+        // Three quarters at 120 BPM at 44.1kHz = ~1.5 s × 44100 ≈
+        // 66150 samples. We render with the loaded events
+        // (including the tempo meta — engine should handle it).
+        let rendered = Audio.MidiRenderToAudio(backEvs, 480, 500000, 44100)
+        // Should be roughly 3 quarters worth of samples. Allow
+        // ±10% slack for end-of-buffer tail handling.
+        let rN: int = rendered.Count()
+        if (rN > 60000 && rN < 80000) {
+            Console.WriteLine("[PASS] MidiRenderToAudio length in range")
+        } else {
+            Console.WriteLine("[FAIL] MidiRenderToAudio length = "
+                + String_FromInt(rN) + " (expected ~66150)")
+        }
+
+        // ── 29. Rendered audio contains non-zero samples ─────
+        // Quick check: scan first 5000 samples for anything
+        // non-zero. A pure NoteOn on note 60 (~262 Hz) at vel 100
+        // should produce audible peaks well within that window.
+        var foundAudio: bool = false
+        var k: int = 0
+        let scanEnd: int = 5000
+        while (k < scanEnd && k < rN) {
+            let sv: int = rendered.Get(k)
+            if (sv > 100 || sv < -100) {
+                foundAudio = true
+                k = scanEnd
+            }
+            k = k + 1
+        }
+        if (foundAudio) {
+            Console.WriteLine("[PASS] MidiRenderToAudio produces audio")
+        } else {
+            Console.WriteLine("[FAIL] MidiRenderToAudio output is silent")
+        }
+
+        // ── 30. Rendered audio survives SaveAsWav round-trip ─
+        let wavPath: string = "/tmp/amc_midi_render_test.wav"
+        let midiWavOk: bool = Audio.SaveAsWav(rendered, 44100, wavPath)
+        if (midiWavOk) {
+            let dur: int = Audio.DurationMsOf(wavPath)
+            // Expected ~1500 ms for 3 quarters at 120 BPM.
+            if (dur > 1200 && dur < 1800) {
+                Console.WriteLine("[PASS] MIDI→audio→WAV round-trip ~1.5s")
+            } else {
+                Console.WriteLine("[FAIL] MIDI→WAV duration = "
+                    + String_FromInt(dur) + " ms")
+            }
+        } else {
+            Console.WriteLine("[FAIL] MIDI→WAV save failed: " + Audio.LastError())
+        }
+
+        // ── 31. LoadSmf on missing file returns empty + error ─
+        let missing = Audio.MidiLoadSmf("/tmp/does_not_exist.mid")
+        if (missing.Count() == 0) {
+            Console.WriteLine("[PASS] MidiLoadSmf rejects missing file")
+        } else {
+            Console.WriteLine("[FAIL] MidiLoadSmf missing file returned "
+                + String_FromInt(missing.Count()) + " ints")
+        }
     }
 }

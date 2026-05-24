@@ -35,7 +35,7 @@ are part of the manifest and forwarded automatically.
 
 ```bash
 amc package add audio                                  # via index
-amc package add github.com/amalgame-lang/amalgame-audio@v0.5.0
+amc package add github.com/amalgame-lang/amalgame-audio@v0.6.0
 ```
 
 Requires **amc 0.5.4+** (precompile-on-install — miniaudio's
@@ -247,6 +247,83 @@ instead of accidentally hitting a recycled slot.
 removed from the active set inside the audio callback. The slot
 becomes available for future `AddSource` calls.
 
+### v0.6.0 additions — MIDI (SMF file IO + render to audio)
+
+Load and save Standard MIDI Files (.mid), and render them
+straight to a `List<int>` audio buffer using an internal sine
+synth. Pure C, no external dep, fully cross-platform — every
+piece works the same on Linux, macOS and Windows.
+
+| Method | Returns | Notes |
+|---|---|---|
+| `Audio.MidiLoadSmf(path)` | `List<int>` | Flat list of packed events (groups of 4) |
+| `Audio.MidiSaveSmf(path, events, ticksPerQuarter, tempoUsPerQuarter)` | `bool` | Single-track format-0 SMF |
+| `Audio.MidiRenderToAudio(events, ticksPerQuarter, tempoUsPerQuarter, sampleRate)` | `List<int>` | 16-bit mono int16, sine-synth per active note |
+| `Audio.MidiLastTicksPerQuarter()` | `int` | Sonde — division of the last loaded file |
+| `Audio.MidiLastTempo()` | `int` | µs per quarter-note from the first tempo meta in the last loaded file |
+
+**Event packing**: events come back as a flat `List<int>`
+walked in **groups of 4** — `(delta_ticks, status, data1, data2)`.
+The packed layout avoids a `List<List<int>>` (one allocation
+per event) which would be unbearable for a typical multi-
+thousand-event SMF.
+
+```amalgame
+// Load a .mid, render to audio, save as WAV.
+let events = Audio.MidiLoadSmf("song.mid")
+let tpq    = Audio.MidiLastTicksPerQuarter()
+let tempo  = Audio.MidiLastTempo()                      // µs/quarter
+let audio  = Audio.MidiRenderToAudio(events, tpq, tempo, 44100)
+Audio.SaveAsWav(audio, 44100, "song.wav")               // or Audio.Play(audio, 44100)
+```
+
+```amalgame
+// Build a C-major arpeggio from scratch and save.
+let evs = new List<int>()
+// (delta_ticks, status, data1, data2) — status 144 = NoteOn ch0, 128 = NoteOff ch0
+evs.Add(0);   evs.Add(144); evs.Add(60); evs.Add(100)   // NoteOn  C4
+evs.Add(480); evs.Add(128); evs.Add(60); evs.Add(0)     // NoteOff C4 (1 quarter later)
+evs.Add(0);   evs.Add(144); evs.Add(64); evs.Add(100)   // NoteOn  E4
+evs.Add(480); evs.Add(128); evs.Add(64); evs.Add(0)
+evs.Add(0);   evs.Add(144); evs.Add(67); evs.Add(100)   // NoteOn  G4
+evs.Add(480); evs.Add(128); evs.Add(67); evs.Add(0)
+
+Audio.MidiSaveSmf("/tmp/arpeggio.mid", evs, 480, 500000)  // 120 BPM
+```
+
+**Supported event types** (read + write):
+
+- NoteOff (`0x80`), NoteOn (`0x90`)
+- PolyAftertouch (`0xA0`), CC (`0xB0`)
+- ProgramChange (`0xC0`), ChanPressure (`0xD0`)
+- PitchBend (`0xE0`)
+- Tempo meta-event (`0xFF 0x51`)
+
+**Skipped on read** (parsed past but not emitted to the user):
+text / copyright / time-sig / key-sig / SMPTE-offset meta-events,
+sysex (`0xF0` / `0xF7`). End-of-track (`0x2F`) marks track
+boundaries internally.
+
+**Multi-track files** (SMF format 1) are merged at load time —
+each track's events are resolved into absolute ticks, sorted
+across tracks, then re-emitted as deltas. The caller sees one
+linear stream as if the file were format 0.
+
+**RenderToAudio** uses simple additive sine synthesis: each
+NoteOn starts a sine wave at the note's frequency scaled by
+`velocity / 127`; NoteOff (or NoteOn with velocity 0) stops it.
+Concurrent notes mix additively with int16 clip. Tempo
+meta-events update the wallclock rate mid-stream. Pitch bend
+and CC are not currently rendered (v0.7+ ask).
+
+**MIDI device IO** (live keyboard input, hardware-synth
+control) is **not** in v0.6 — it needs a portable cross-
+platform wrapper across ALSA seq on Linux, CoreMIDI on macOS
+and winmm on Windows, which is a meaty separate piece. Tracked
+for v0.7+. SMF file IO covers the most common MIDI workflow
+(load song → render to audio → save as WAV) without any
+device dependency.
+
 ### Sample format
 
 All v1 surface operates on **16-bit signed PCM mono samples**, with
@@ -254,7 +331,7 @@ each sample stored in AM as `int` (i64). Signed range `[-32768, 32767]`,
 zero = silence. Sample rate is passed as a separate argument
 (typical: 44100, 48000, 8000) and is not stored inside the buffer.
 
-Multi-channel + 32-bit float pipelines land in v0.6+.
+Multi-channel + 32-bit float pipelines land in v0.7+.
 
 ### Saving to a WAV file
 
@@ -280,9 +357,14 @@ amc -o submarine_ping submarine_ping.am
 aplay /tmp/submarine_ping.wav    # or open in any audio player
 ```
 
-## Deferred to v0.6+
+## Deferred to v0.7+
 
-- MIDI in/out (SMF file IO + device IO via cross-platform wrapper) — coming in v0.6
+- MIDI device IO (live keyboards, hardware-synth control) —
+  needs a portable cross-platform wrapper (ALSA seq on Linux,
+  CoreMIDI on macOS, winmm on Windows). v0.6 ships SMF file IO
+  + render-to-audio, which covers the most common workflow.
+- MIDI render: pitch-bend and CC support (v0.6 renders NoteOn /
+  NoteOff only)
 - Real-time synth via user-provided callback (callbacks interact
   subtly with bdwgc thread pinning)
 - Pitch shift / time stretch / FFT analysis
@@ -308,6 +390,12 @@ capture; the full `PlayStart` → `PlayPause` → `PlayResume` →
 → `MixerStop` flow against two real sine tones for the live
 mixer (audible-free against a developer machine — the tones
 play during the run but the test is state-machine, not audio).
+v0.6 MIDI tests run on every machine (pure file IO + pure synth,
+no device access) and verify a full round-trip: build a C-major
+arpeggio in-memory → `MidiSaveSmf` → `MidiLoadSmf` → assert the
+parsed event count + tempo + first-event-is-tempo-meta →
+`MidiRenderToAudio` → assert audio length + non-silent samples
+→ `SaveAsWav` → `DurationMsOf` ~= the rendered length.
 
 ## Licence
 

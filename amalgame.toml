@@ -35,24 +35,33 @@
 #                MixerSetPaused / MixerRemoveSource /
 #                MixerSourceCount / MixerStop
 #
-# Out of scope (v0.6+):
-#   - MIDI in/out (file IO + device IO) — coming in v0.6
+# Surface (v0.6 additions):
+#   MIDI:  MidiLoadSmf / MidiSaveSmf / MidiRenderToAudio /
+#          MidiLastTicksPerQuarter / MidiLastTempo
+#         (SMF file IO + render-to-audio via internal sine
+#          synth. MIDI device IO — live keyboards / hardware
+#          synths — deferred to v0.7+.)
+#
+# Out of scope (v0.7+):
+#   - MIDI device IO (live keyboards, hardware synths) —
+#     needs portable cross-platform wrapper (ALSA seq on
+#     Linux, CoreMIDI on macOS, winmm on Windows)
 #   - Real-time synthesis via user-provided callback
 #   - Pitch shift / time stretch / FFT analysis
-#   - Spatial audio / HRTF (mixer itself is mono, no panning yet)
-#   - Multi-channel pipelines (stereo / surround) — v0.5 keeps
+#   - Spatial audio / HRTF (mixer is mono, no panning yet)
+#   - Multi-channel pipelines (stereo / surround) — v0.6 keeps
 #     mono int16 as the canonical buffer type
 #
 # Installation:
 #
 #   amc package add audio                                # via index
-#   amc package add github.com/amalgame-lang/amalgame-audio@v0.5.0
+#   amc package add github.com/amalgame-lang/amalgame-audio@v0.6.0
 
 [package]
 name              = "amalgame-audio"
-version           = "0.5.0"
+version           = "0.6.0"
 license           = "Apache-2.0"
-description       = "Audio synth + streaming playback + capture + live mixer + multi-format decode (WAV/MP3/FLAC/OGG) for Amalgame — miniaudio (public domain), vendored."
+description       = "Audio synth + streaming playback + capture + live mixer + multi-format decode + MIDI SMF for Amalgame — miniaudio (public domain), vendored."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.5.4"
 schema-version    = 1
@@ -126,5 +135,12 @@ MixerSetPaused     = { returns = "code_bool" }
 MixerRemoveSource  = { returns = "code_bool" }
 MixerSourceCount   = { returns = "i64" }
 MixerStop          = { returns = "code_bool" }
+
+# v0.6 — MIDI (Standard MIDI File IO + render to audio)
+MidiLoadSmf              = { returns = "AmalgameList*" }
+MidiSaveSmf              = { returns = "code_bool" }
+MidiRenderToAudio        = { returns = "AmalgameList*" }
+MidiLastTicksPerQuarter  = { returns = "i64" }
+MidiLastTempo            = { returns = "i64" }
 
 [dependencies]
