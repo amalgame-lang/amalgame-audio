@@ -448,25 +448,23 @@ public class Program {
 
         // ── 28. RenderToAudio produces non-empty mono int16 buffer ─
         // Three quarters at 120 BPM at 44.1kHz = ~1.5 s × 44100 ≈
-        // 66150 samples. We render with the loaded events
-        // (including the tempo meta — engine should handle it).
+        // 66150 samples. v0.7 adds a 30 ms release tail flush at
+        // end-of-stream, so the upper bound becomes ~67500.
         let rendered = Audio.MidiRenderToAudio(backEvs, 480, 500000, 44100)
-        // Should be roughly 3 quarters worth of samples. Allow
-        // ±10% slack for end-of-buffer tail handling.
         let rN: int = rendered.Count()
         if (rN > 60000 && rN < 80000) {
             Console.WriteLine("[PASS] MidiRenderToAudio length in range")
         } else {
             Console.WriteLine("[FAIL] MidiRenderToAudio length = "
-                + String_FromInt(rN) + " (expected ~66150)")
+                + String_FromInt(rN) + " (expected ~66150 + release tail)")
         }
 
         // ── 29. Rendered audio contains non-zero samples ─────
-        // Quick check: scan first 5000 samples for anything
-        // non-zero. A pure NoteOn on note 60 (~262 Hz) at vel 100
-        // should produce audible peaks well within that window.
+        // Scan a window past the 5 ms attack ramp (220 samples
+        // at 44.1 kHz). A NoteOn on note 60 at vel 100 should
+        // produce audible peaks well within 5000 samples.
         var foundAudio: bool = false
-        var k: int = 0
+        var k: int = 250
         let scanEnd: int = 5000
         while (k < scanEnd && k < rN) {
             let sv: int = rendered.Get(k)
@@ -480,6 +478,21 @@ public class Program {
             Console.WriteLine("[PASS] MidiRenderToAudio produces audio")
         } else {
             Console.WriteLine("[FAIL] MidiRenderToAudio output is silent")
+        }
+
+        // ── 29b. Attack envelope ramps from ~0 ───────────────
+        // First sample should be near silence (attack envelope
+        // is 5 ms — at sample 0 the gain factor is 0.0). v0.6
+        // would have started immediately at full velocity =>
+        // ~6500 magnitude. v0.7 should start near 0.
+        let firstSample: int = rendered.Get(0)
+        var firstAbs: int = firstSample
+        if (firstAbs < 0) { firstAbs = 0 - firstAbs }
+        if (firstAbs < 100) {
+            Console.WriteLine("[PASS] Attack envelope: first sample near 0")
+        } else {
+            Console.WriteLine("[FAIL] Attack envelope: first sample = "
+                + String_FromInt(firstSample))
         }
 
         // ── 30. Rendered audio survives SaveAsWav round-trip ─
@@ -505,6 +518,84 @@ public class Program {
         } else {
             Console.WriteLine("[FAIL] MidiLoadSmf missing file returned "
                 + String_FromInt(missing.Count()) + " ints")
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  v0.7 — stereo helpers
+        // ═══════════════════════════════════════════════════════
+        //
+        // Pure data-pipeline tests, no device deps.
+
+        // ── 32. MonoToStereo doubles the count, L=R ──────────
+        let monoTest = Audio.GenSine(440.0, 0.1, 44100)   // 4410 samples
+        let stereoTest = Audio.MonoToStereo(monoTest)
+        // Stereo: every mono sample appears twice (interleaved).
+        // Count should be 2 × 4410 = 8820.
+        if (stereoTest.Count() == 8820) {
+            Console.WriteLine("[PASS] MonoToStereo doubles count")
+        } else {
+            Console.WriteLine("[FAIL] MonoToStereo count = "
+                + String_FromInt(stereoTest.Count()))
+        }
+
+        // ── 33. MonoToStereo: L sample == R sample at same frame ─
+        let mL: int = stereoTest.Get(200)        // L of frame 100
+        let mR: int = stereoTest.Get(201)        // R of frame 100
+        let mO: int = monoTest.Get(100)
+        if (mL == mO && mR == mO) {
+            Console.WriteLine("[PASS] MonoToStereo: L == R == mono source")
+        } else {
+            Console.WriteLine("[FAIL] L=" + String_FromInt(mL)
+                + " R=" + String_FromInt(mR)
+                + " mono=" + String_FromInt(mO))
+        }
+
+        // ── 34. StereoToMono(MonoToStereo(x)) == x (round-trip) ─
+        let backMono = Audio.StereoToMono(stereoTest)
+        let lenOk2: bool = backMono.Count() == monoTest.Count()
+        let val0: bool = backMono.Get(500) == monoTest.Get(500)
+        let val1: bool = backMono.Get(2000) == monoTest.Get(2000)
+        if (lenOk2 && val0 && val1) {
+            Console.WriteLine("[PASS] Stereo→Mono round-trip preserves samples")
+        } else {
+            Console.WriteLine("[FAIL] Mono round-trip diverged")
+        }
+
+        // ── 35. SaveAsWavStereo + LoadWavStereo round-trip ────
+        let stPath: string = "/tmp/amc_audio_stereo_test.wav"
+        let stOk: bool = Audio.SaveAsWavStereo(stereoTest, 44100, stPath)
+        if (stOk) {
+            Console.WriteLine("[PASS] SaveAsWavStereo")
+        } else {
+            Console.WriteLine("[FAIL] SaveAsWavStereo: " + Audio.LastError())
+        }
+        let stBack = Audio.LoadWavStereo(stPath)
+        if (stBack.Count() == stereoTest.Count()) {
+            Console.WriteLine("[PASS] LoadWavStereo length round-trip")
+        } else {
+            Console.WriteLine("[FAIL] LoadWavStereo got "
+                + String_FromInt(stBack.Count())
+                + " expected " + String_FromInt(stereoTest.Count()))
+        }
+
+        // ── 36. Stereo WAV reports 2 channels via ChannelCountOf ─
+        let stCh: int = Audio.ChannelCountOf(stPath)
+        if (stCh == 2) {
+            Console.WriteLine("[PASS] Stereo WAV has 2 channels")
+        } else {
+            Console.WriteLine("[FAIL] Stereo WAV ChannelCountOf = "
+                + String_FromInt(stCh))
+        }
+
+        // ── 37. StereoToMono rejects odd-length input ────────
+        let badStereo = new List<int>()
+        badStereo.Add(100); badStereo.Add(200); badStereo.Add(300)   // 3 ints
+        let badMono = Audio.StereoToMono(badStereo)
+        if (badMono.Count() == 0) {
+            Console.WriteLine("[PASS] StereoToMono rejects odd-length input")
+        } else {
+            Console.WriteLine("[FAIL] StereoToMono on odd input returned "
+                + String_FromInt(badMono.Count()))
         }
     }
 }
