@@ -74,7 +74,7 @@ echo ""
 # ── Stage a fake cache pointing at the working tree ──
 FAKE_CACHE="$BUILD_DIR/cache"
 PKG_GIT="github.com/amalgame-lang/amalgame-audio"
-PKG_TAG="${PKG_TAG:-v0.5.0}"
+PKG_TAG="${PKG_TAG:-v0.6.0}"
 FAKE_SHA="deadbeefcafebabe0000000000000000000000ab"
 SHORT_SHA="${FAKE_SHA:0:8}"
 PKG_CACHE_DIR="$FAKE_CACHE/$PKG_GIT/${PKG_TAG}_${SHORT_SHA}"
@@ -188,6 +188,19 @@ run_test "MixerSetGain/SetPaused"     "[PASS] MixerSetGain/SetPaused on live voi
 run_test "MixerRemoveSource"          "[PASS] MixerRemoveSource decrements count"     "[SKIP] MixerRemoveSource"
 run_test "MixerSetGain stale id"      "[PASS] MixerSetGain on stale voice id is false" "[SKIP] MixerSetGain stale id"
 run_test "MixerStop returns true"     "[PASS] MixerStop returns true"                 "[SKIP] MixerStop"
+
+echo ""
+echo "── Audio v0.6 (MIDI SMF + render) ──────────"
+# MIDI tests don't touch any device — pure file IO + pure
+# synthesis. Run on every machine.
+run_test "MidiSaveSmf writer"         "[PASS] MidiSaveSmf round-trip writer"
+run_test "MidiLoadSmf count"          "[PASS] MidiLoadSmf 28 ints (6 notes + tempo meta)"
+run_test "MidiLast* sondes"           "[PASS] MidiLast* sondes return saved values"
+run_test "First event = tempo meta"   "[PASS] First event is tempo meta (FF 51 500000)"
+run_test "MidiRenderToAudio length"   "[PASS] MidiRenderToAudio length in range"
+run_test "MidiRenderToAudio audible"  "[PASS] MidiRenderToAudio produces audio"
+run_test "MIDI→audio→WAV round-trip"  "[PASS] MIDI→audio→WAV round-trip ~1.5s"
+run_test "MidiLoadSmf missing file"   "[PASS] MidiLoadSmf rejects missing file"
 
 echo ""
 echo "────────────────────────────────────────────"

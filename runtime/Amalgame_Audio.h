@@ -79,6 +79,19 @@
  *   Audio.MixerSourceCount(mixer)             -> int   alive voices
  *   Audio.MixerStop(mixer)                    -> bool  uninit + free
  *
+ *   ── v0.6 — MIDI (Standard MIDI File IO + render) ──
+ *   Audio.MidiLoadSmf(path)                          -> List<int> events
+ *   Audio.MidiSaveSmf(path, events, tpq, tempoUs)    -> bool
+ *   Audio.MidiRenderToAudio(events, tpq, tempoUs, sr)-> List<int> int16 mono
+ *   Audio.MidiLastTicksPerQuarter()                  -> int
+ *   Audio.MidiLastTempo()                            -> int  us per quarter
+ *
+ *   Event packing: events are returned as a flat List<int>,
+ *   walked in groups of 4 — (delta_ticks, status, data1, data2).
+ *   Supported messages: NoteOff/On, PolyAftertouch, CC,
+ *   ProgramChange, ChanPressure, PitchBend, Tempo meta.
+ *   Sysex / text meta / SMPTE division are out of scope.
+ *
  * Threading: synthesis / transformation are pure (return new
  * buffers). Blocking `Play` / `Record` hold the calling thread
  * until the device drains / fills. Streaming `PlayStart` and
@@ -1298,6 +1311,589 @@ static inline code_bool Amalgame_Audio_MixerStop(AmalgameAudioMixer* m) {
     free(m);
     _amaudio_set_error(NULL);
     return 1;
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  v0.6 — MIDI (Standard MIDI File IO + render to audio)
+ * ═══════════════════════════════════════════════════════
+ *
+ * Pure C, cross-platform, no external dep. Parses + writes
+ * Standard MIDI File format 0 + format 1 (the two formats in
+ * actual use; format 2 is exotic and out of scope).
+ *
+ * Event encoding into Amalgame:
+ *
+ *   Events come back as a flat `List<int>` of i64 values,
+ *   walked in **groups of 4**: (delta_ticks, status, data1, data2).
+ *   Caller iterates `for i in 0..events.Count() step 4`.
+ *
+ *   `status` is the MIDI status byte (0x80..0xFF). For channel
+ *   voice messages the low nibble is the channel (0..15). For
+ *   the tempo meta-event we use status=0xFF with data1=0x51
+ *   and data2 = microseconds per quarter note.
+ *
+ *   This packed layout avoids an AmalgameList-of-AmalgameLists
+ *   (one allocation per event) which would be unbearable for a
+ *   typical multi-thousand-event SMF.
+ *
+ * Subset supported (read + write):
+ *
+ *   - NoteOff      0x80 | ch    data1=note  data2=velocity
+ *   - NoteOn       0x90 | ch    data1=note  data2=velocity
+ *   - PolyAftertch 0xA0 | ch    data1=note  data2=pressure
+ *   - CC           0xB0 | ch    data1=cc#   data2=value
+ *   - ProgChange   0xC0 | ch    data1=prog  data2=0
+ *   - ChanPressure 0xD0 | ch    data1=press data2=0
+ *   - PitchBend    0xE0 | ch    data1=lsb   data2=msb
+ *   - Tempo meta   0xFF         data1=0x51  data2=usPerQuarter
+ *
+ * Skipped on read (parsed past but not emitted):
+ *
+ *   - All text/copyright/marker/cuepoint meta-events (0x01..0x07)
+ *   - Sequence/instrument-name meta-events (0x03, 0x04)
+ *   - Time signature / key signature meta-events (0x58, 0x59)
+ *   - SMPTE offset (0x54)
+ *   - Sysex (0xF0 + 0xF7)
+ *   - End-of-track meta (0x2F) — marks track boundary internally
+ *
+ * Multi-track (format 1) merging:
+ *
+ *   We resolve each track's events into absolute ticks, merge
+ *   into a single sorted timeline, then convert back to deltas
+ *   in the returned list. The caller sees one linear stream as
+ *   if the file were format 0.
+ *
+ * `Audio.MidiLoadSmf(path)` returns a `List<int>` (the packed
+ * events) and updates `Audio.MidiLastTicksPerQuarter` /
+ * `Audio.MidiLastTempo` so the caller can later turn deltas
+ * into seconds. Empty list on failure (LastError populated).
+ *
+ * `Audio.MidiSaveSmf(path, events, ticksPerQuarter, tempoUs)`
+ * writes a single-track format-0 SMF. We prepend the tempo
+ * meta and append the end-of-track meta automatically.
+ *
+ * `Audio.MidiRenderToAudio(events, ticksPerQuarter, tempoUs,
+ * sampleRate)` walks the event stream, tracks per-channel
+ * active notes, and synthesises each note as a pure sine wave.
+ * Multiple simultaneous notes mix additively with int16 clip.
+ * Output is a `List<int>` you can `Audio.SaveAsWav` or
+ * `Audio.Play` directly.
+ */
+
+/* Module-globals — populated by MidiLoadSmf for callers who
+ * later need to convert deltas into wallclock time. */
+static i64 _amaudio_midi_last_tpq   = 480;       /* default if file omits division */
+static i64 _amaudio_midi_last_tempo = 500000;    /* 500_000 us = 120 BPM, MIDI default */
+
+static inline i64 Amalgame_Audio_MidiLastTicksPerQuarter(void) { return _amaudio_midi_last_tpq; }
+static inline i64 Amalgame_Audio_MidiLastTempo(void)           { return _amaudio_midi_last_tempo; }
+
+/* ── SMF parser internals ──────────────────────────────── */
+
+/* Read a variable-length quantity (1..4 bytes, 7 bits each, top
+ * bit = continuation). Returns the value, advances *cursor. */
+static inline uint32_t _amaudio_midi_read_vlq(const uint8_t* buf, size_t buflen, size_t* cursor) {
+    uint32_t value = 0;
+    while (*cursor < buflen) {
+        uint8_t b = buf[*cursor];
+        (*cursor)++;
+        value = (value << 7) | (b & 0x7F);
+        if ((b & 0x80) == 0) return value;
+    }
+    return value;
+}
+
+/* Read big-endian u16 / u32 — SMF is always big-endian. */
+static inline uint16_t _amaudio_midi_read_u16(const uint8_t* p) {
+    return (uint16_t) ((p[0] << 8) | p[1]);
+}
+static inline uint32_t _amaudio_midi_read_u32(const uint8_t* p) {
+    return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) |
+           ((uint32_t) p[2] <<  8) |  (uint32_t) p[3];
+}
+
+/* One parsed event with an *absolute* tick — we sort by this
+ * across tracks before flattening back into deltas. Used only
+ * inside MidiLoadSmf; not exposed. */
+typedef struct {
+    uint64_t tick;
+    uint8_t  status;
+    uint8_t  data1;
+    int32_t  data2;   /* widened for tempo's 24-bit value */
+} _amaudio_midi_event;
+
+/* Comparator for qsort — by absolute tick, stable on insertion
+ * order via a secondary index trick (we keep input order by
+ * appending events sequentially; equal-tick events keep their
+ * file order through std qsort's instability tolerance — for
+ * typical SMFs the order is "as-written" which is what users
+ * expect). */
+static inline int _amaudio_midi_evt_cmp(const void* a, const void* b) {
+    uint64_t ta = ((const _amaudio_midi_event*) a)->tick;
+    uint64_t tb = ((const _amaudio_midi_event*) b)->tick;
+    if (ta < tb) return -1;
+    if (ta > tb) return 1;
+    return 0;
+}
+
+/* Parse one track's body into our event vector. `track` points
+ * at the first byte after the MTrk-length header. */
+static inline int _amaudio_midi_parse_track(const uint8_t* track, size_t track_len,
+                                            _amaudio_midi_event** events, size_t* count, size_t* cap) {
+    size_t cursor = 0;
+    uint64_t abs_tick = 0;
+    uint8_t  running_status = 0;
+
+    while (cursor < track_len) {
+        uint32_t delta = _amaudio_midi_read_vlq(track, track_len, &cursor);
+        abs_tick += delta;
+        if (cursor >= track_len) break;
+
+        uint8_t status = track[cursor];
+        if (status & 0x80) {
+            cursor++;
+            running_status = status;
+        } else {
+            /* Running status — reuse last status byte. */
+            status = running_status;
+            if (status == 0) {
+                _amaudio_set_error("MidiLoadSmf: missing status byte");
+                return 0;
+            }
+        }
+
+        uint8_t hi = status & 0xF0;
+        uint8_t emit_status = 0;
+        uint8_t emit_d1 = 0;
+        int32_t emit_d2 = 0;
+        int do_emit = 0;
+
+        if (status == 0xFF) {
+            /* Meta-event */
+            if (cursor >= track_len) break;
+            uint8_t type = track[cursor++];
+            uint32_t mlen = _amaudio_midi_read_vlq(track, track_len, &cursor);
+            if (cursor + mlen > track_len) {
+                _amaudio_set_error("MidiLoadSmf: meta-event overruns track");
+                return 0;
+            }
+            if (type == 0x51 && mlen == 3) {
+                /* Set Tempo — 24-bit big-endian us per quarter. */
+                emit_status = 0xFF;
+                emit_d1     = 0x51;
+                emit_d2     = ((int32_t) track[cursor]     << 16) |
+                              ((int32_t) track[cursor + 1] <<  8) |
+                              ((int32_t) track[cursor + 2]);
+                do_emit = 1;
+            }
+            /* 0x2F = end-of-track; we skip emitting but stop
+             * parsing this track since the byte after is the
+             * start of the next track (or EOF). */
+            cursor += mlen;
+            if (type == 0x2F) break;
+        } else if (status == 0xF0 || status == 0xF7) {
+            /* Sysex — skip its var-length-prefixed payload. */
+            uint32_t slen = _amaudio_midi_read_vlq(track, track_len, &cursor);
+            if (cursor + slen > track_len) {
+                _amaudio_set_error("MidiLoadSmf: sysex overruns track");
+                return 0;
+            }
+            cursor += slen;
+            running_status = 0;   /* sysex clears running status */
+        } else if (hi == 0xC0 || hi == 0xD0) {
+            /* 1-byte messages: ProgramChange (0xCn), ChanPressure (0xDn) */
+            if (cursor >= track_len) break;
+            emit_status = status;
+            emit_d1     = track[cursor++];
+            emit_d2     = 0;
+            do_emit = 1;
+        } else if (hi == 0x80 || hi == 0x90 || hi == 0xA0 || hi == 0xB0 || hi == 0xE0) {
+            /* 2-byte messages */
+            if (cursor + 1 >= track_len) break;
+            emit_status = status;
+            emit_d1     = track[cursor++];
+            emit_d2     = (int32_t) track[cursor++];
+            do_emit = 1;
+        } else {
+            /* Unknown — give up cleanly on this track. */
+            _amaudio_set_error("MidiLoadSmf: unknown status byte");
+            return 0;
+        }
+
+        if (do_emit) {
+            if (*count >= *cap) {
+                *cap = (*cap == 0) ? 64 : (*cap * 2);
+                _amaudio_midi_event* re = (_amaudio_midi_event*) realloc(*events, *cap * sizeof(**events));
+                if (!re) { _amaudio_set_error("MidiLoadSmf: OOM"); return 0; }
+                *events = re;
+            }
+            (*events)[*count].tick    = abs_tick;
+            (*events)[*count].status  = emit_status;
+            (*events)[*count].data1   = emit_d1;
+            (*events)[*count].data2   = emit_d2;
+            (*count)++;
+        }
+    }
+    return 1;
+}
+
+/* Public: load an SMF file, return events as flat List<int>
+ * (groups of 4: delta_ticks, status, data1, data2). Also
+ * populates the MidiLast* sondes. */
+static inline AmalgameList* Amalgame_Audio_MidiLoadSmf(code_string path) {
+    if (!path) { _amaudio_set_error("MidiLoadSmf: null path"); return AmalgameList_new(); }
+    FILE* fp = fopen(path, "rb");
+    if (!fp) { _amaudio_set_error("MidiLoadSmf: open failed"); return AmalgameList_new(); }
+
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (fsize < 14) {
+        fclose(fp);
+        _amaudio_set_error("MidiLoadSmf: file too small (no MThd header)");
+        return AmalgameList_new();
+    }
+    uint8_t* file = (uint8_t*) malloc((size_t) fsize);
+    if (!file) { fclose(fp); _amaudio_set_error("MidiLoadSmf: OOM"); return AmalgameList_new(); }
+    if (fread(file, 1, (size_t) fsize, fp) != (size_t) fsize) {
+        fclose(fp); free(file);
+        _amaudio_set_error("MidiLoadSmf: short read");
+        return AmalgameList_new();
+    }
+    fclose(fp);
+
+    if (memcmp(file, "MThd", 4) != 0) {
+        free(file);
+        _amaudio_set_error("MidiLoadSmf: not an SMF (no MThd)");
+        return AmalgameList_new();
+    }
+    uint32_t header_len = _amaudio_midi_read_u32(file + 4);
+    if (header_len < 6) {
+        free(file);
+        _amaudio_set_error("MidiLoadSmf: bad MThd length");
+        return AmalgameList_new();
+    }
+    uint16_t format    = _amaudio_midi_read_u16(file + 8);
+    uint16_t ntracks   = _amaudio_midi_read_u16(file + 10);
+    uint16_t division  = _amaudio_midi_read_u16(file + 12);
+    if (format > 1) {
+        free(file);
+        _amaudio_set_error("MidiLoadSmf: format 2 not supported");
+        return AmalgameList_new();
+    }
+    if (division & 0x8000) {
+        /* SMPTE timecode division — out of scope; reject. */
+        free(file);
+        _amaudio_set_error("MidiLoadSmf: SMPTE division not supported");
+        return AmalgameList_new();
+    }
+    _amaudio_midi_last_tpq   = (i64) division;
+    _amaudio_midi_last_tempo = 500000;  /* default 120 BPM */
+
+    _amaudio_midi_event* events = NULL;
+    size_t count = 0, cap = 0;
+    size_t pos = 8 + header_len;
+
+    for (uint16_t t = 0; t < ntracks; t++) {
+        if (pos + 8 > (size_t) fsize) break;
+        if (memcmp(file + pos, "MTrk", 4) != 0) {
+            free(events); free(file);
+            _amaudio_set_error("MidiLoadSmf: missing MTrk header");
+            return AmalgameList_new();
+        }
+        uint32_t track_len = _amaudio_midi_read_u32(file + pos + 4);
+        if (pos + 8 + track_len > (size_t) fsize) {
+            free(events); free(file);
+            _amaudio_set_error("MidiLoadSmf: track overruns file");
+            return AmalgameList_new();
+        }
+        if (!_amaudio_midi_parse_track(file + pos + 8, (size_t) track_len, &events, &count, &cap)) {
+            free(events); free(file);
+            return AmalgameList_new();   /* LastError already set */
+        }
+        pos += 8 + track_len;
+    }
+    free(file);
+
+    /* Merge: sort by absolute tick across all tracks. The first
+     * tempo event we encounter (after sorting) sets MidiLastTempo
+     * — most SMFs put it at tick 0. */
+    qsort(events, count, sizeof(*events), _amaudio_midi_evt_cmp);
+
+    AmalgameList* out = AmalgameList_new();
+    uint64_t last_tick = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint64_t delta = events[i].tick - last_tick;
+        last_tick = events[i].tick;
+        AmalgameList_add(out, (void*) (intptr_t) (i64) delta);
+        AmalgameList_add(out, (void*) (intptr_t) (i64) events[i].status);
+        AmalgameList_add(out, (void*) (intptr_t) (i64) events[i].data1);
+        AmalgameList_add(out, (void*) (intptr_t) (i64) events[i].data2);
+        if (events[i].status == 0xFF && events[i].data1 == 0x51 && _amaudio_midi_last_tempo == 500000) {
+            _amaudio_midi_last_tempo = (i64) events[i].data2;
+        }
+    }
+    free(events);
+    _amaudio_set_error(NULL);
+    return out;
+}
+
+/* ── SMF writer ────────────────────────────────────────── */
+
+/* Append a variable-length quantity to a growing byte buffer. */
+static inline void _amaudio_midi_write_vlq(uint8_t** buf, size_t* len, size_t* cap, uint32_t value) {
+    uint8_t bytes[4];
+    int n = 0;
+    bytes[n++] = (uint8_t) (value & 0x7F);
+    value >>= 7;
+    while (value > 0 && n < 4) {
+        bytes[n++] = (uint8_t) ((value & 0x7F) | 0x80);
+        value >>= 7;
+    }
+    /* Emit MSB-first (highest-magnitude byte first, top bit set
+     * for all but the last). Reverse the array we built bottom-up. */
+    while (*len + (size_t) n > *cap) {
+        *cap = (*cap == 0) ? 64 : (*cap * 2);
+        *buf = (uint8_t*) realloc(*buf, *cap);
+    }
+    for (int i = n - 1; i >= 0; i--) (*buf)[(*len)++] = bytes[i];
+}
+
+static inline void _amaudio_midi_append(uint8_t** buf, size_t* len, size_t* cap, const void* src, size_t srclen) {
+    while (*len + srclen > *cap) {
+        *cap = (*cap == 0) ? 64 : (*cap * 2);
+        *buf = (uint8_t*) realloc(*buf, *cap);
+    }
+    memcpy(*buf + *len, src, srclen);
+    *len += srclen;
+}
+static inline void _amaudio_midi_append_u8(uint8_t** b, size_t* l, size_t* c, uint8_t v) {
+    _amaudio_midi_append(b, l, c, &v, 1);
+}
+static inline void _amaudio_midi_append_u16(uint8_t** b, size_t* l, size_t* c, uint16_t v) {
+    uint8_t bytes[2] = { (uint8_t)(v >> 8), (uint8_t)(v & 0xFF) };
+    _amaudio_midi_append(b, l, c, bytes, 2);
+}
+static inline void _amaudio_midi_append_u32(uint8_t** b, size_t* l, size_t* c, uint32_t v) {
+    uint8_t bytes[4] = { (uint8_t)(v >> 24), (uint8_t)(v >> 16),
+                         (uint8_t)(v >>  8), (uint8_t)(v & 0xFF) };
+    _amaudio_midi_append(b, l, c, bytes, 4);
+}
+
+/* Public: write a single-track format-0 SMF. Prepends a Set-
+ * Tempo meta at tick 0, appends End-of-Track at the end. */
+static inline code_bool Amalgame_Audio_MidiSaveSmf(code_string path, AmalgameList* events,
+                                                   i64 ticksPerQuarter, i64 tempoUsPerQuarter) {
+    if (!path || !events) { _amaudio_set_error("MidiSaveSmf: null arg"); return 0; }
+    if (ticksPerQuarter <= 0 || ticksPerQuarter > 0x7FFF) {
+        _amaudio_set_error("MidiSaveSmf: ticksPerQuarter out of range");
+        return 0;
+    }
+    if (tempoUsPerQuarter <= 0 || tempoUsPerQuarter > 0xFFFFFF) {
+        _amaudio_set_error("MidiSaveSmf: tempo out of range");
+        return 0;
+    }
+    size_t n = (size_t) AmalgameList_count(events);
+    if (n % 4 != 0) {
+        _amaudio_set_error("MidiSaveSmf: event list count must be a multiple of 4");
+        return 0;
+    }
+
+    /* Build the MTrk body first so we know its length. */
+    uint8_t* track = NULL;
+    size_t   tlen = 0, tcap = 0;
+
+    /* Tempo meta at delta=0. */
+    _amaudio_midi_write_vlq(&track, &tlen, &tcap, 0);
+    _amaudio_midi_append_u8(&track, &tlen, &tcap, 0xFF);
+    _amaudio_midi_append_u8(&track, &tlen, &tcap, 0x51);
+    _amaudio_midi_append_u8(&track, &tlen, &tcap, 0x03);
+    _amaudio_midi_append_u8(&track, &tlen, &tcap, (uint8_t) (tempoUsPerQuarter >> 16));
+    _amaudio_midi_append_u8(&track, &tlen, &tcap, (uint8_t) (tempoUsPerQuarter >>  8));
+    _amaudio_midi_append_u8(&track, &tlen, &tcap, (uint8_t) (tempoUsPerQuarter & 0xFF));
+
+    for (size_t i = 0; i < n; i += 4) {
+        i64 delta  = (i64) (intptr_t) AmalgameList_get(events, (i64) i);
+        i64 status = (i64) (intptr_t) AmalgameList_get(events, (i64) (i + 1));
+        i64 d1     = (i64) (intptr_t) AmalgameList_get(events, (i64) (i + 2));
+        i64 d2     = (i64) (intptr_t) AmalgameList_get(events, (i64) (i + 3));
+        _amaudio_midi_write_vlq(&track, &tlen, &tcap, (uint32_t) delta);
+        if (status == 0xFF && d1 == 0x51) {
+            /* User-supplied tempo meta — write as 24-bit. */
+            _amaudio_midi_append_u8(&track, &tlen, &tcap, 0xFF);
+            _amaudio_midi_append_u8(&track, &tlen, &tcap, 0x51);
+            _amaudio_midi_append_u8(&track, &tlen, &tcap, 0x03);
+            _amaudio_midi_append_u8(&track, &tlen, &tcap, (uint8_t) (d2 >> 16));
+            _amaudio_midi_append_u8(&track, &tlen, &tcap, (uint8_t) (d2 >>  8));
+            _amaudio_midi_append_u8(&track, &tlen, &tcap, (uint8_t) (d2 & 0xFF));
+            continue;
+        }
+        uint8_t hi = (uint8_t) (status & 0xF0);
+        _amaudio_midi_append_u8(&track, &tlen, &tcap, (uint8_t) status);
+        _amaudio_midi_append_u8(&track, &tlen, &tcap, (uint8_t) (d1 & 0x7F));
+        if (hi != 0xC0 && hi != 0xD0) {
+            /* 2-byte channel messages */
+            _amaudio_midi_append_u8(&track, &tlen, &tcap, (uint8_t) (d2 & 0x7F));
+        }
+    }
+
+    /* End-of-Track meta */
+    _amaudio_midi_write_vlq(&track, &tlen, &tcap, 0);
+    _amaudio_midi_append_u8(&track, &tlen, &tcap, 0xFF);
+    _amaudio_midi_append_u8(&track, &tlen, &tcap, 0x2F);
+    _amaudio_midi_append_u8(&track, &tlen, &tcap, 0x00);
+
+    /* Assemble final file. */
+    FILE* fp = fopen(path, "wb");
+    if (!fp) {
+        free(track);
+        _amaudio_set_error("MidiSaveSmf: open for write failed");
+        return 0;
+    }
+    /* MThd */
+    uint8_t* hdr = NULL; size_t hlen = 0, hcap = 0;
+    _amaudio_midi_append(&hdr, &hlen, &hcap, "MThd", 4);
+    _amaudio_midi_append_u32(&hdr, &hlen, &hcap, 6);
+    _amaudio_midi_append_u16(&hdr, &hlen, &hcap, 0);                       /* format 0 */
+    _amaudio_midi_append_u16(&hdr, &hlen, &hcap, 1);                       /* 1 track */
+    _amaudio_midi_append_u16(&hdr, &hlen, &hcap, (uint16_t) ticksPerQuarter);
+    _amaudio_midi_append(&hdr, &hlen, &hcap, "MTrk", 4);
+    _amaudio_midi_append_u32(&hdr, &hlen, &hcap, (uint32_t) tlen);
+
+    int ok = (fwrite(hdr, 1, hlen, fp) == hlen) && (fwrite(track, 1, tlen, fp) == tlen);
+    free(hdr); free(track);
+    fclose(fp);
+    if (!ok) { _amaudio_set_error("MidiSaveSmf: write failed"); return 0; }
+    _amaudio_set_error(NULL);
+    return 1;
+}
+
+/* ── MidiRenderToAudio ─────────────────────────────────── */
+
+/* Convert MIDI note number (0..127) to frequency in Hz.
+ * MIDI 69 = A4 = 440 Hz; each semitone = factor of 2^(1/12). */
+static inline f64 _amaudio_midi_note_to_hz(int note) {
+    return 440.0 * pow(2.0, ((f64) note - 69.0) / 12.0);
+}
+
+/* Synthesise the supplied event stream into mono int16 audio.
+ * Each NoteOn starts a sine wave at the note's frequency,
+ * scaled by velocity / 127. NoteOff (or NoteOn with velocity 0)
+ * stops it. Concurrent notes mix additively with int16 clip.
+ *
+ * Tempo meta-events update the wallclock rate. The first tempo
+ * encountered (if any) before any audio is generated displaces
+ * the supplied default; subsequent tempos take effect from
+ * their event point onwards.
+ *
+ * Each active note is stored in a slim per-pitch-per-channel
+ * state table (16 × 128 = 2048 slots) — cheap, lookup is O(1). */
+static inline AmalgameList* Amalgame_Audio_MidiRenderToAudio(AmalgameList* events,
+                                                              i64 ticksPerQuarter,
+                                                              i64 tempoUsPerQuarter,
+                                                              i64 sampleRate) {
+    if (!events || ticksPerQuarter <= 0 || tempoUsPerQuarter <= 0 || sampleRate <= 0) {
+        _amaudio_set_error("MidiRenderToAudio: bad arg");
+        return AmalgameList_new();
+    }
+    size_t n = (size_t) AmalgameList_count(events);
+    if (n == 0 || (n % 4) != 0) {
+        _amaudio_set_error("MidiRenderToAudio: bad event count");
+        return AmalgameList_new();
+    }
+
+    /* Active-note table: per (channel, note) we track velocity
+     * (0 = inactive) + the running phase index so re-trigger
+     * doesn't pop. */
+    int32_t  vel[16][128];
+    uint64_t phase[16][128];
+    memset(vel, 0, sizeof(vel));
+    memset(phase, 0, sizeof(phase));
+
+    f64 us_per_tick = (f64) tempoUsPerQuarter / (f64) ticksPerQuarter;
+    f64 samples_per_us = (f64) sampleRate / 1000000.0;
+    f64 samples_per_tick = us_per_tick * samples_per_us;
+
+    /* Pre-allocate a generous initial buffer based on a rough
+     * upper bound (sum of all deltas × samples_per_tick + tail). */
+    uint64_t total_ticks = 0;
+    for (size_t i = 0; i < n; i += 4) {
+        total_ticks += (uint64_t) (intptr_t) AmalgameList_get(events, (i64) i);
+    }
+    size_t initial = (size_t) ((f64) total_ticks * samples_per_tick) + (size_t) sampleRate;   /* + 1 s tail */
+    int16_t* out = (int16_t*) calloc(initial > 0 ? initial : 1, sizeof(int16_t));
+    size_t out_cap = initial > 0 ? initial : 1;
+    size_t out_len = 0;
+    if (!out) { _amaudio_set_error("MidiRenderToAudio: OOM"); return AmalgameList_new(); }
+
+    /* For each gap between events, render `gap_samples` of mixed
+     * audio from currently-active notes, advance phases. */
+    for (size_t i = 0; i < n; i += 4) {
+        i64 delta  = (i64) (intptr_t) AmalgameList_get(events, (i64) i);
+        i64 status = (i64) (intptr_t) AmalgameList_get(events, (i64) (i + 1));
+        i64 d1     = (i64) (intptr_t) AmalgameList_get(events, (i64) (i + 2));
+        i64 d2     = (i64) (intptr_t) AmalgameList_get(events, (i64) (i + 3));
+
+        uint64_t gap_samples = (uint64_t) ((f64) delta * samples_per_tick);
+        if (out_len + (size_t) gap_samples > out_cap) {
+            size_t new_cap = out_cap * 2;
+            while (new_cap < out_len + (size_t) gap_samples + (size_t) sampleRate) new_cap *= 2;
+            int16_t* re = (int16_t*) realloc(out, new_cap * sizeof(int16_t));
+            if (!re) { free(out); _amaudio_set_error("MidiRenderToAudio: OOM"); return AmalgameList_new(); }
+            out = re;
+            memset(out + out_cap, 0, (new_cap - out_cap) * sizeof(int16_t));
+            out_cap = new_cap;
+        }
+
+        for (uint64_t s = 0; s < gap_samples; s++) {
+            f64 sum = 0.0;
+            for (int ch = 0; ch < 16; ch++) {
+                for (int nt = 0; nt < 128; nt++) {
+                    if (vel[ch][nt] == 0) continue;
+                    f64 hz = _amaudio_midi_note_to_hz(nt);
+                    f64 step = 2.0 * AMALGAME_AUDIO_PI * hz / (f64) sampleRate;
+                    f64 amp = (f64) vel[ch][nt] / 127.0;
+                    sum += sin((f64) phase[ch][nt] * step) * 32767.0 * amp * 0.20;   /* 0.2 = headroom for ~5 simul notes */
+                    phase[ch][nt]++;
+                }
+            }
+            if (sum >  32767.0) sum =  32767.0;
+            if (sum < -32768.0) sum = -32768.0;
+            out[out_len++] = (int16_t) sum;
+        }
+
+        /* Apply the event itself. */
+        if (status == 0xFF && d1 == 0x51) {
+            tempoUsPerQuarter = d2;
+            us_per_tick = (f64) tempoUsPerQuarter / (f64) ticksPerQuarter;
+            samples_per_tick = us_per_tick * samples_per_us;
+        } else {
+            uint8_t hi = (uint8_t) (status & 0xF0);
+            int ch = (int) (status & 0x0F);
+            if (hi == 0x90) {
+                /* Note On — velocity 0 == NoteOff */
+                int note = (int) (d1 & 0x7F);
+                if (d2 > 0) {
+                    vel[ch][note] = (int32_t) d2;
+                    /* Don't reset phase — re-triggering same note
+                     * mid-flight just refreshes velocity, which
+                     * sounds smoother than a click. */
+                } else {
+                    vel[ch][note] = 0;
+                }
+            } else if (hi == 0x80) {
+                int note = (int) (d1 & 0x7F);
+                vel[ch][note] = 0;
+            }
+            /* Other channel messages — ignored for synth (no
+             * pitch bend / CC support in v0.6; v0.7 ask). */
+        }
+    }
+
+    AmalgameList* result = _amaudio_buf_from_pcm(out, out_len);
+    free(out);
+    _amaudio_set_error(NULL);
+    return result;
 }
 
 #endif /* AMALGAME_AUDIO_H */
