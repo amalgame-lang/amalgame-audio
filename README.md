@@ -35,7 +35,7 @@ are part of the manifest and forwarded automatically.
 
 ```bash
 amc package add audio                                  # via index
-amc package add github.com/amalgame-lang/amalgame-audio@v0.6.0
+amc package add github.com/amalgame-lang/amalgame-audio@v0.7.0
 ```
 
 Requires **amc 0.5.4+** (precompile-on-install — miniaudio's
@@ -320,9 +320,54 @@ and CC are not currently rendered (v0.7+ ask).
 control) is **not** in v0.6 — it needs a portable cross-
 platform wrapper across ALSA seq on Linux, CoreMIDI on macOS
 and winmm on Windows, which is a meaty separate piece. Tracked
-for v0.7+. SMF file IO covers the most common MIDI workflow
+for v0.8+. SMF file IO covers the most common MIDI workflow
 (load song → render to audio → save as WAV) without any
 device dependency.
+
+### v0.7.0 additions — stereo helpers + MIDI render polish
+
+Two themes in one release: a small set of stereo helpers for
+users who need interleaved L/R, and a render-quality bump for
+`MidiRenderToAudio`.
+
+**Stereo helpers** — keep mono as canonical, add explicit
+stereo conversion + IO for users who need it:
+
+| Method | Returns | Notes |
+|---|---|---|
+| `Audio.MonoToStereo(mono)` | `List<int>` | Interleave `L = R` |
+| `Audio.StereoToMono(stereo)` | `List<int>` | Average L+R (clips to int16) |
+| `Audio.SaveAsWavStereo(stereo, sampleRate, path)` | `bool` | 16-bit PCM stereo WAV |
+| `Audio.LoadWavStereo(path)` | `List<int>` | Decode any file, returns interleaved int16 |
+
+Stereo buffer layout is **interleaved**: `L0 R0 L1 R1 L2 R2 ...`
+— same as on disk. For a `durSec`-second buffer at `sampleRate` Hz,
+the stereo buffer has `2 × durSec × sampleRate` int16 entries.
+
+```amalgame
+// Generate a sine, duplicate to stereo, save as 2-channel WAV.
+let mono   = Audio.GenSine(440.0, 1.0, 44100)
+let stereo = Audio.MonoToStereo(mono)
+Audio.SaveAsWavStereo(stereo, 44100, "tone-stereo.wav")
+```
+
+The non-stereo loaders (`Audio.LoadWav`, `Audio.Load`, etc.)
+keep downmixing to mono — v0.7 is strictly additive. Surround
+/ multi-channel >2 / float32 are still v0.8+.
+
+**`MidiRenderToAudio` polish** (same signature, audibly better
+output):
+
+- **Per-note 5 ms attack ramp** — `NoteOn` no longer clicks.
+- **Per-note 30 ms release ramp** — `NoteOff` no longer clicks;
+  the note continues to decay naturally after release.
+- **Pitch-bend rendering** (status `0xE0`, 14-bit value
+  centered at `8192`, ±2 semitone range = GM default). Per-
+  channel state, so bends on one channel don't bleed to others.
+
+The release tail is rendered as a final flush after the last
+event — buffers are now ~30 ms longer than in v0.6 but you
+finally get the natural fade-out instead of a hard cut.
 
 ### Sample format
 
@@ -331,7 +376,10 @@ each sample stored in AM as `int` (i64). Signed range `[-32768, 32767]`,
 zero = silence. Sample rate is passed as a separate argument
 (typical: 44100, 48000, 8000) and is not stored inside the buffer.
 
-Multi-channel + 32-bit float pipelines land in v0.7+.
+v0.7's stereo helpers add an interleaved-stereo layout option
+alongside mono (the canonical format for synth / transform /
+single-channel IO is unchanged). Multi-channel >2 + 32-bit
+float pipelines land in v0.8+.
 
 ### Saving to a WAV file
 
@@ -357,19 +405,20 @@ amc -o submarine_ping submarine_ping.am
 aplay /tmp/submarine_ping.wav    # or open in any audio player
 ```
 
-## Deferred to v0.7+
+## Deferred to v0.8+
 
-- MIDI device IO (live keyboards, hardware-synth control) —
+- **MIDI device IO** (live keyboards, hardware-synth control) —
   needs a portable cross-platform wrapper (ALSA seq on Linux,
-  CoreMIDI on macOS, winmm on Windows). v0.6 ships SMF file IO
-  + render-to-audio, which covers the most common workflow.
-- MIDI render: pitch-bend and CC support (v0.6 renders NoteOn /
-  NoteOff only)
+  CoreMIDI on macOS, winmm on Windows). SMF file IO + render
+  (v0.6) covers the most common workflow without it.
+- **MIDI render: CC** (volume, sustain pedal, modulation) —
+  v0.7 added pitch-bend; CC and program-change are still
+  parsed-but-not-rendered.
 - Real-time synth via user-provided callback (callbacks interact
   subtly with bdwgc thread pinning)
 - Pitch shift / time stretch / FFT analysis
 - Spatial audio / HRTF / panning — the v0.5 mixer is mono summing only
-- Stereo and float32 sample formats
+- Multi-channel >2 (surround) and float32 sample formats
 
 ## Tests
 

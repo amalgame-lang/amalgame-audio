@@ -40,28 +40,38 @@
 #          MidiLastTicksPerQuarter / MidiLastTempo
 #         (SMF file IO + render-to-audio via internal sine
 #          synth. MIDI device IO — live keyboards / hardware
-#          synths — deferred to v0.7+.)
+#          synths — deferred to v0.8+.)
 #
-# Out of scope (v0.7+):
+# Surface (v0.7 additions):
+#   Stereo helpers:  MonoToStereo / StereoToMono /
+#                    SaveAsWavStereo / LoadWavStereo
+#                    (interleaved int16 LR layout)
+#   MidiRenderToAudio polish:
+#     - per-note attack envelope (5 ms ramp)   — no click on NoteOn
+#     - per-note release envelope (30 ms ramp) — no click on NoteOff
+#     - pitch-bend rendering, ±2 semitones (GM default)
+#
+# Out of scope (v0.8+):
 #   - MIDI device IO (live keyboards, hardware synths) —
 #     needs portable cross-platform wrapper (ALSA seq on
 #     Linux, CoreMIDI on macOS, winmm on Windows)
 #   - Real-time synthesis via user-provided callback
 #   - Pitch shift / time stretch / FFT analysis
 #   - Spatial audio / HRTF (mixer is mono, no panning yet)
-#   - Multi-channel pipelines (stereo / surround) — v0.6 keeps
-#     mono int16 as the canonical buffer type
+#   - Multi-channel pipelines (surround / 32-bit float)
+#   - MIDI render: CC / ProgramChange / ChanPressure / poly-
+#     aftertouch (accepted on read, ignored by the synth)
 #
 # Installation:
 #
 #   amc package add audio                                # via index
-#   amc package add github.com/amalgame-lang/amalgame-audio@v0.6.0
+#   amc package add github.com/amalgame-lang/amalgame-audio@v0.7.0
 
 [package]
 name              = "amalgame-audio"
-version           = "0.6.0"
+version           = "0.7.0"
 license           = "Apache-2.0"
-description       = "Audio synth + streaming playback + capture + live mixer + multi-format decode + MIDI SMF for Amalgame — miniaudio (public domain), vendored."
+description       = "Audio synth + streaming playback + capture + live mixer + multi-format decode + MIDI SMF (render w/ envelope + pitch-bend) + stereo helpers for Amalgame — miniaudio (public domain), vendored."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.5.4"
 schema-version    = 1
@@ -142,5 +152,12 @@ MidiSaveSmf              = { returns = "code_bool" }
 MidiRenderToAudio        = { returns = "AmalgameList*" }
 MidiLastTicksPerQuarter  = { returns = "i64" }
 MidiLastTempo            = { returns = "i64" }
+
+# v0.7 — stereo helpers (MidiRenderToAudio also gains envelope
+# + pitch-bend rendering — same signature, no new method)
+MonoToStereo       = { returns = "AmalgameList*" }
+StereoToMono       = { returns = "AmalgameList*" }
+SaveAsWavStereo    = { returns = "code_bool" }
+LoadWavStereo      = { returns = "AmalgameList*" }
 
 [dependencies]

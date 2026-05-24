@@ -92,6 +92,15 @@
  *   ProgramChange, ChanPressure, PitchBend, Tempo meta.
  *   Sysex / text meta / SMPTE division are out of scope.
  *
+ *   ── v0.7 — stereo helpers + MIDI render polish ──
+ *   Audio.MonoToStereo(mono)                  -> List<int> interleaved L=R
+ *   Audio.StereoToMono(stereo)                -> List<int> averaged mono
+ *   Audio.SaveAsWavStereo(stereo, sr, path)   -> bool   16-bit stereo WAV
+ *   Audio.LoadWavStereo(path)                 -> List<int> interleaved
+ *   MidiRenderToAudio adds per-note attack/release envelopes
+ *   (5 ms / 30 ms) so NoteOn/Off no longer click, plus pitch-
+ *   bend rendering with ±2-semitone range (GM default).
+ *
  * Threading: synthesis / transformation are pure (return new
  * buffers). Blocking `Play` / `Record` hold the calling thread
  * until the device drains / fills. Streaming `PlayStart` and
@@ -1779,15 +1788,40 @@ static inline f64 _amaudio_midi_note_to_hz(int note) {
 /* Synthesise the supplied event stream into mono int16 audio.
  * Each NoteOn starts a sine wave at the note's frequency,
  * scaled by velocity / 127. NoteOff (or NoteOn with velocity 0)
- * stops it. Concurrent notes mix additively with int16 clip.
+ * starts a short release tail. Concurrent notes mix additively
+ * with int16 clip.
+ *
+ * v0.7 additions over v0.6:
+ *   - **Per-note attack envelope** (5 ms linear ramp from 0)
+ *     so NoteOn doesn't click.
+ *   - **Per-note release envelope** (30 ms linear ramp to 0)
+ *     so NoteOff doesn't click. The note continues to decay
+ *     after NoteOff; re-triggering it during the release tail
+ *     resets to attack.
+ *   - **Pitch bend rendering** (status 0xE0, 14-bit value
+ *     centered at 8192, ±2-semitone range — the GM default).
+ *     Per-channel state, so a bend on ch 0 doesn't affect ch 1.
  *
  * Tempo meta-events update the wallclock rate. The first tempo
  * encountered (if any) before any audio is generated displaces
  * the supplied default; subsequent tempos take effect from
  * their event point onwards.
  *
- * Each active note is stored in a slim per-pitch-per-channel
- * state table (16 × 128 = 2048 slots) — cheap, lookup is O(1). */
+ * Active-note state lives in a slim per-(channel, note) table
+ * (16 × 128 = 2048 slots) — cheap, lookup is O(1). The release
+ * tail is encoded by a `released` flag + a sample counter; once
+ * the counter passes the release window the slot goes inactive. */
+
+/* Attack / release in milliseconds — short enough to feel
+ * snappy for percussive content, long enough to kill the
+ * obvious click. */
+#ifndef AMAUDIO_MIDI_ATTACK_MS
+#  define AMAUDIO_MIDI_ATTACK_MS  5.0
+#endif
+#ifndef AMAUDIO_MIDI_RELEASE_MS
+#  define AMAUDIO_MIDI_RELEASE_MS 30.0
+#endif
+
 static inline AmalgameList* Amalgame_Audio_MidiRenderToAudio(AmalgameList* events,
                                                               i64 ticksPerQuarter,
                                                               i64 tempoUsPerQuarter,
@@ -1802,32 +1836,101 @@ static inline AmalgameList* Amalgame_Audio_MidiRenderToAudio(AmalgameList* event
         return AmalgameList_new();
     }
 
-    /* Active-note table: per (channel, note) we track velocity
-     * (0 = inactive) + the running phase index so re-trigger
-     * doesn't pop. */
+    /* Per-(channel, note) state.
+     *   vel       — current velocity (0 = inactive / past release)
+     *   age       — samples elapsed since NoteOn; used for attack ramp
+     *   phase     — sample-counter for the sine generator
+     *   released  — 1 once NoteOff has fired
+     *   rel_samp  — samples elapsed since NoteOff (counted only when released)
+     */
     int32_t  vel[16][128];
+    uint64_t age[16][128];
     uint64_t phase[16][128];
+    uint8_t  released[16][128];
+    uint64_t rel_samp[16][128];
     memset(vel, 0, sizeof(vel));
+    memset(age, 0, sizeof(age));
     memset(phase, 0, sizeof(phase));
+    memset(released, 0, sizeof(released));
+    memset(rel_samp, 0, sizeof(rel_samp));
+
+    /* Per-channel pitch-bend in semitones (float). GM default
+     * range is ±2 semitones across the 0..16383 wheel range. */
+    f64 bend_semis[16];
+    for (int c = 0; c < 16; c++) bend_semis[c] = 0.0;
 
     f64 us_per_tick = (f64) tempoUsPerQuarter / (f64) ticksPerQuarter;
     f64 samples_per_us = (f64) sampleRate / 1000000.0;
     f64 samples_per_tick = us_per_tick * samples_per_us;
 
-    /* Pre-allocate a generous initial buffer based on a rough
-     * upper bound (sum of all deltas × samples_per_tick + tail). */
+    uint64_t attack_samples  = (uint64_t) (AMAUDIO_MIDI_ATTACK_MS  * 0.001 * (f64) sampleRate);
+    uint64_t release_samples = (uint64_t) (AMAUDIO_MIDI_RELEASE_MS * 0.001 * (f64) sampleRate);
+    if (attack_samples  == 0) attack_samples  = 1;
+    if (release_samples == 0) release_samples = 1;
+
+    /* Pre-size: total ticks + 1 s tail for the release of the
+     * last NoteOff. */
     uint64_t total_ticks = 0;
     for (size_t i = 0; i < n; i += 4) {
         total_ticks += (uint64_t) (intptr_t) AmalgameList_get(events, (i64) i);
     }
-    size_t initial = (size_t) ((f64) total_ticks * samples_per_tick) + (size_t) sampleRate;   /* + 1 s tail */
+    size_t initial = (size_t) ((f64) total_ticks * samples_per_tick) + (size_t) sampleRate;
     int16_t* out = (int16_t*) calloc(initial > 0 ? initial : 1, sizeof(int16_t));
     size_t out_cap = initial > 0 ? initial : 1;
     size_t out_len = 0;
     if (!out) { _amaudio_set_error("MidiRenderToAudio: OOM"); return AmalgameList_new(); }
 
-    /* For each gap between events, render `gap_samples` of mixed
-     * audio from currently-active notes, advance phases. */
+    /* Render `gap_samples` of audio between events. Shared
+     * helper since we also flush the release tail after the
+     * last event. */
+    #define _AMAUDIO_MIDI_RENDER_GAP(GAP_SAMPLES) do { \
+        uint64_t _gap = (GAP_SAMPLES); \
+        if (out_len + (size_t) _gap > out_cap) { \
+            size_t new_cap = out_cap * 2; \
+            while (new_cap < out_len + (size_t) _gap + (size_t) sampleRate) new_cap *= 2; \
+            int16_t* re = (int16_t*) realloc(out, new_cap * sizeof(int16_t)); \
+            if (!re) { free(out); _amaudio_set_error("MidiRenderToAudio: OOM"); return AmalgameList_new(); } \
+            out = re; \
+            memset(out + out_cap, 0, (new_cap - out_cap) * sizeof(int16_t)); \
+            out_cap = new_cap; \
+        } \
+        for (uint64_t s = 0; s < _gap; s++) { \
+            f64 sum = 0.0; \
+            for (int ch = 0; ch < 16; ch++) { \
+                f64 bend_factor = pow(2.0, bend_semis[ch] / 12.0); \
+                for (int nt = 0; nt < 128; nt++) { \
+                    if (vel[ch][nt] == 0) continue; \
+                    /* Envelope */ \
+                    f64 env = 1.0; \
+                    if (age[ch][nt] < attack_samples) { \
+                        env = (f64) age[ch][nt] / (f64) attack_samples; \
+                    } \
+                    if (released[ch][nt]) { \
+                        if (rel_samp[ch][nt] >= release_samples) { \
+                            vel[ch][nt] = 0; \
+                            released[ch][nt] = 0; \
+                            rel_samp[ch][nt] = 0; \
+                            age[ch][nt] = 0; \
+                            continue; \
+                        } \
+                        f64 rel_env = 1.0 - ((f64) rel_samp[ch][nt] / (f64) release_samples); \
+                        env *= rel_env; \
+                        rel_samp[ch][nt]++; \
+                    } \
+                    f64 hz = _amaudio_midi_note_to_hz(nt) * bend_factor; \
+                    f64 step = 2.0 * AMALGAME_AUDIO_PI * hz / (f64) sampleRate; \
+                    f64 amp = (f64) vel[ch][nt] / 127.0; \
+                    sum += sin((f64) phase[ch][nt] * step) * 32767.0 * amp * env * 0.20; \
+                    phase[ch][nt]++; \
+                    age[ch][nt]++; \
+                } \
+            } \
+            if (sum >  32767.0) sum =  32767.0; \
+            if (sum < -32768.0) sum = -32768.0; \
+            out[out_len++] = (int16_t) sum; \
+        } \
+    } while (0)
+
     for (size_t i = 0; i < n; i += 4) {
         i64 delta  = (i64) (intptr_t) AmalgameList_get(events, (i64) i);
         i64 status = (i64) (intptr_t) AmalgameList_get(events, (i64) (i + 1));
@@ -1835,32 +1938,7 @@ static inline AmalgameList* Amalgame_Audio_MidiRenderToAudio(AmalgameList* event
         i64 d2     = (i64) (intptr_t) AmalgameList_get(events, (i64) (i + 3));
 
         uint64_t gap_samples = (uint64_t) ((f64) delta * samples_per_tick);
-        if (out_len + (size_t) gap_samples > out_cap) {
-            size_t new_cap = out_cap * 2;
-            while (new_cap < out_len + (size_t) gap_samples + (size_t) sampleRate) new_cap *= 2;
-            int16_t* re = (int16_t*) realloc(out, new_cap * sizeof(int16_t));
-            if (!re) { free(out); _amaudio_set_error("MidiRenderToAudio: OOM"); return AmalgameList_new(); }
-            out = re;
-            memset(out + out_cap, 0, (new_cap - out_cap) * sizeof(int16_t));
-            out_cap = new_cap;
-        }
-
-        for (uint64_t s = 0; s < gap_samples; s++) {
-            f64 sum = 0.0;
-            for (int ch = 0; ch < 16; ch++) {
-                for (int nt = 0; nt < 128; nt++) {
-                    if (vel[ch][nt] == 0) continue;
-                    f64 hz = _amaudio_midi_note_to_hz(nt);
-                    f64 step = 2.0 * AMALGAME_AUDIO_PI * hz / (f64) sampleRate;
-                    f64 amp = (f64) vel[ch][nt] / 127.0;
-                    sum += sin((f64) phase[ch][nt] * step) * 32767.0 * amp * 0.20;   /* 0.2 = headroom for ~5 simul notes */
-                    phase[ch][nt]++;
-                }
-            }
-            if (sum >  32767.0) sum =  32767.0;
-            if (sum < -32768.0) sum = -32768.0;
-            out[out_len++] = (int16_t) sum;
-        }
+        _AMAUDIO_MIDI_RENDER_GAP(gap_samples);
 
         /* Apply the event itself. */
         if (status == 0xFF && d1 == 0x51) {
@@ -1871,29 +1949,174 @@ static inline AmalgameList* Amalgame_Audio_MidiRenderToAudio(AmalgameList* event
             uint8_t hi = (uint8_t) (status & 0xF0);
             int ch = (int) (status & 0x0F);
             if (hi == 0x90) {
-                /* Note On — velocity 0 == NoteOff */
                 int note = (int) (d1 & 0x7F);
                 if (d2 > 0) {
                     vel[ch][note] = (int32_t) d2;
-                    /* Don't reset phase — re-triggering same note
-                     * mid-flight just refreshes velocity, which
-                     * sounds smoother than a click. */
+                    age[ch][note] = 0;
+                    released[ch][note] = 0;
+                    rel_samp[ch][note] = 0;
                 } else {
-                    vel[ch][note] = 0;
+                    /* Velocity-0 NoteOn = NoteOff */
+                    if (vel[ch][note] > 0) {
+                        released[ch][note] = 1;
+                        rel_samp[ch][note] = 0;
+                    }
                 }
             } else if (hi == 0x80) {
                 int note = (int) (d1 & 0x7F);
-                vel[ch][note] = 0;
+                if (vel[ch][note] > 0) {
+                    released[ch][note] = 1;
+                    rel_samp[ch][note] = 0;
+                }
+            } else if (hi == 0xE0) {
+                /* Pitch bend — 14-bit value, lsb in d1, msb in
+                 * d2, centered at 8192 = 0x2000. ±2 semitones. */
+                int32_t bend14 = (int32_t) ((d2 & 0x7F) << 7) | (int32_t) (d1 & 0x7F);
+                f64 norm = ((f64) bend14 - 8192.0) / 8192.0;     /* -1..+1 */
+                bend_semis[ch] = norm * 2.0;
             }
-            /* Other channel messages — ignored for synth (no
-             * pitch bend / CC support in v0.6; v0.7 ask). */
+            /* Other channel messages (CC / PolyAftertouch /
+             * ProgChange / ChanPressure) — accepted on read
+             * but not rendered by this minimal synth. */
         }
     }
+
+    /* Flush remaining release tails. We render up to the
+     * longest possible tail (= release_samples worth of audio)
+     * so every released note has time to fade naturally. */
+    _AMAUDIO_MIDI_RENDER_GAP(release_samples);
+
+    #undef _AMAUDIO_MIDI_RENDER_GAP
 
     AmalgameList* result = _amaudio_buf_from_pcm(out, out_len);
     free(out);
     _amaudio_set_error(NULL);
     return result;
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  v0.7 — stereo helpers
+ * ═══════════════════════════════════════════════════════
+ *
+ * The package canonicalises on 16-bit signed mono PCM — that's
+ * what every synth / transform / IO method returns. v0.7 adds
+ * a small set of helpers for users who DO want stereo: an
+ * interleaving mono→stereo converter (L = R), a downmixing
+ * stereo→mono converter (averaged), and dedicated WAV IO for
+ * stereo buffers.
+ *
+ * Stereo buffer layout is **interleaved** int16: L0 R0 L1 R1
+ * L2 R2 ... — the same layout the WAV format uses on disk.
+ * For a `durSec` second buffer at `sampleRate` Hz, the stereo
+ * buffer has 2 × durSec × sampleRate int16 entries.
+ *
+ *   Audio.MonoToStereo(mono)            -> List<int>  L=R interleaved
+ *   Audio.StereoToMono(stereo)          -> List<int>  averaged
+ *   Audio.SaveAsWavStereo(stereo, sr, path) -> bool   16-bit stereo WAV
+ *   Audio.LoadWavStereo(path)           -> List<int>  interleaved int16
+ *
+ * Multi-channel >2 is out of scope; v0.8+ may add a generic
+ * channel-count surface (stereo / surround / etc.). The
+ * non-stereo loaders (`Audio.LoadWav`, `Audio.Load`, etc.)
+ * keep downmixing to mono — v0.7 is strictly additive. */
+
+/* Interleave a mono buffer into stereo with L = R. */
+static inline AmalgameList* Amalgame_Audio_MonoToStereo(AmalgameList* mono) {
+    if (!mono) { _amaudio_set_error("MonoToStereo: null buf"); return AmalgameList_new(); }
+    size_t n = (size_t) AmalgameList_count(mono);
+    AmalgameList* out = AmalgameList_new();
+    for (size_t i = 0; i < n; i++) {
+        i64 v = (i64) (intptr_t) AmalgameList_get(mono, (i64) i);
+        AmalgameList_add(out, (void*) (intptr_t) v);
+        AmalgameList_add(out, (void*) (intptr_t) v);
+    }
+    return out;
+}
+
+/* Average a stereo buffer down to mono. Input must have even
+ * length (L R pairs). Out-of-range averages clip to int16. */
+static inline AmalgameList* Amalgame_Audio_StereoToMono(AmalgameList* stereo) {
+    if (!stereo) { _amaudio_set_error("StereoToMono: null buf"); return AmalgameList_new(); }
+    size_t n = (size_t) AmalgameList_count(stereo);
+    if (n % 2 != 0) {
+        _amaudio_set_error("StereoToMono: stereo buffer length must be even");
+        return AmalgameList_new();
+    }
+    AmalgameList* out = AmalgameList_new();
+    for (size_t i = 0; i < n; i += 2) {
+        i64 l = (i64) (intptr_t) AmalgameList_get(stereo, (i64) i);
+        i64 r = (i64) (intptr_t) AmalgameList_get(stereo, (i64) (i + 1));
+        i64 avg = (l + r) / 2;
+        if (avg >  32767) avg =  32767;
+        if (avg < -32768) avg = -32768;
+        AmalgameList_add(out, (void*) (intptr_t) avg);
+    }
+    return out;
+}
+
+/* Save an interleaved stereo int16 buffer as a 16-bit PCM
+ * stereo WAV via ma_encoder. Length must be even. */
+static inline code_bool Amalgame_Audio_SaveAsWavStereo(AmalgameList* samples, i64 sampleRate, code_string path) {
+    if (!samples || !path) { _amaudio_set_error("SaveAsWavStereo: null arg"); return 0; }
+    size_t n = 0;
+    int16_t* pcm = _amaudio_pcm_from_buf(samples, &n);
+    if (!pcm) { _amaudio_set_error("SaveAsWavStereo: OOM"); return 0; }
+    if (n % 2 != 0) {
+        free(pcm);
+        _amaudio_set_error("SaveAsWavStereo: stereo buffer length must be even");
+        return 0;
+    }
+    ma_encoder_config cfg = ma_encoder_config_init(
+        ma_encoding_format_wav, ma_format_s16, 2, (ma_uint32) sampleRate);
+    ma_encoder enc;
+    if (ma_encoder_init_file(path, &cfg, &enc) != MA_SUCCESS) {
+        free(pcm);
+        _amaudio_set_error("SaveAsWavStereo: ma_encoder_init_file failed");
+        return 0;
+    }
+    ma_uint64 frames = (ma_uint64) (n / 2);   /* one frame = L+R */
+    ma_uint64 written = 0;
+    ma_result rc = ma_encoder_write_pcm_frames(&enc, pcm, frames, &written);
+    ma_encoder_uninit(&enc);
+    free(pcm);
+    if (rc != MA_SUCCESS || written != frames) {
+        _amaudio_set_error("SaveAsWavStereo: write_pcm_frames failed");
+        return 0;
+    }
+    _amaudio_set_error(NULL);
+    return 1;
+}
+
+/* Decode a WAV file into an interleaved stereo int16 List<int>.
+ * Non-stereo / non-PCM-16 input is converted on the fly by
+ * miniaudio. Output count = 2 × frame_count. */
+static inline AmalgameList* Amalgame_Audio_LoadWavStereo(code_string path) {
+    if (!path) { _amaudio_set_error("LoadWavStereo: null path"); return AmalgameList_new(); }
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 2, 0);
+    ma_decoder dec;
+    if (ma_decoder_init_file(path, &cfg, &dec) != MA_SUCCESS) {
+        _amaudio_set_error("LoadWavStereo: ma_decoder_init_file failed");
+        return AmalgameList_new();
+    }
+    ma_uint64 frames = 0;
+    if (ma_decoder_get_length_in_pcm_frames(&dec, &frames) != MA_SUCCESS) {
+        ma_decoder_uninit(&dec);
+        _amaudio_set_error("LoadWavStereo: get_length failed");
+        return AmalgameList_new();
+    }
+    int16_t* pcm = (int16_t*) malloc((size_t) frames * 2 * sizeof(int16_t));
+    if (!pcm) {
+        ma_decoder_uninit(&dec);
+        _amaudio_set_error("LoadWavStereo: OOM");
+        return AmalgameList_new();
+    }
+    ma_uint64 got = 0;
+    ma_decoder_read_pcm_frames(&dec, pcm, frames, &got);
+    ma_decoder_uninit(&dec);
+    AmalgameList* out = _amaudio_buf_from_pcm(pcm, (size_t) got * 2);
+    free(pcm);
+    _amaudio_set_error(NULL);
+    return out;
 }
 
 #endif /* AMALGAME_AUDIO_H */
