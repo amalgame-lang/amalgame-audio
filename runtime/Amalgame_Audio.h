@@ -70,6 +70,15 @@
  *   Audio.PlayIsPaused(handle)            -> bool
  *   Audio.PlaySampleCount(handle)         -> int         current cursor
  *
+ *   ── v0.5 — live AudioMixer (multi-source streaming) ──
+ *   Audio.MixerStart(sampleRate)              -> handle
+ *   Audio.MixerAddSource(mixer, samples, gain, loop) -> i64 voiceId
+ *   Audio.MixerSetGain(mixer, voiceId, gain)  -> bool
+ *   Audio.MixerSetPaused(mixer, voiceId, paused) -> bool
+ *   Audio.MixerRemoveSource(mixer, voiceId)   -> bool
+ *   Audio.MixerSourceCount(mixer)             -> int   alive voices
+ *   Audio.MixerStop(mixer)                    -> bool  uninit + free
+ *
  * Threading: synthesis / transformation are pure (return new
  * buffers). Blocking `Play` / `Record` hold the calling thread
  * until the device drains / fills. Streaming `PlayStart` and
@@ -1003,6 +1012,292 @@ static inline code_bool Amalgame_Audio_PlayIsPaused(AmalgameAudioPlay* ctx) {
 static inline i64 Amalgame_Audio_PlaySampleCount(AmalgameAudioPlay* ctx) {
     if (!ctx) return 0;
     return (i64) ctx->pos;
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  v0.5 — live AudioMixer (multi-source streaming)
+ * ═══════════════════════════════════════════════════════
+ *
+ * `Audio.Mix(a, b, offset)` (v0.1) composes two buffers offline;
+ * `Audio.PlayStart(buf, sr)` (v0.4) streams one buffer to the
+ * device. Neither lets the user start a sound, then start
+ * another *on top of it*, then stop the first while the second
+ * keeps going. That's what a live mixer is for — and it's the
+ * last piece of the v1 surface from Amalgame's ROADMAP.
+ *
+ * Public surface:
+ *
+ *   AmalgameAudioMixer* m = Audio.MixerStart(sampleRate)
+ *   i64 voice = Audio.MixerAddSource(m, samples, gain, loop)
+ *   Audio.MixerSetGain(m, voice, gain)         -> bool
+ *   Audio.MixerSetPaused(m, voice, paused)     -> bool
+ *   Audio.MixerRemoveSource(m, voice)          -> bool
+ *   Audio.MixerSourceCount(m)                  -> int (alive only)
+ *   Audio.MixerStop(m)                         -> bool   uninit + free
+ *
+ * Capacity: hard-capped at 32 voices. Why a fixed array instead
+ * of a dynamic list? The audio callback iterates voices every
+ * device tick (~10 ms); a linked-list with malloc in the audio
+ * thread would be much worse than a 32-slot scan + bool check.
+ * 32 voices is plenty for game audio / interactive demos —
+ * orchestral mockups that need more are a v0.6+ ask.
+ *
+ * Concurrency: a `ma_mutex` protects the voices array. The
+ * audio thread holds the lock for the duration of one callback
+ * (~one frames-worth of mixing — typically 256-1024 samples).
+ * Main-thread mutations (Add/Remove/SetGain/SetPaused) lock
+ * briefly. Contention is negligible in practice.
+ *
+ * Voice IDs are monotonically increasing i64 — never reused
+ * even after a voice drains and its slot is reclaimed. That
+ * means stale ID lookups always cleanly return "not found"
+ * instead of accidentally hitting a recycled slot.
+ *
+ * Same bdwgc-safe pattern as the rest of the package: source
+ * PCM is dup'd at AddSource time into a private C buffer; the
+ * audio callback never touches an AmalgameList.
+ */
+
+#define AMAUDIO_MIXER_MAX_VOICES 32
+
+typedef struct {
+    int            in_use;       /* 1 if slot holds a live source */
+    i64            voice_id;     /* monotonic; 0 = empty slot */
+    int16_t*       pcm;          /* owned copy of source samples */
+    ma_uint64      n;            /* total samples */
+    ma_uint64      pos;          /* read cursor */
+    f64            gain;         /* per-voice gain (0..1+) */
+    int            paused;       /* main-thread settable */
+    int            loop;         /* wrap pos at n instead of finishing */
+} _amaudio_mixer_voice;
+
+typedef struct AmalgameAudioMixer {
+    _amaudio_mixer_voice voices[AMAUDIO_MIXER_MAX_VOICES];
+    ma_mutex             lock;
+    ma_device            dev;
+    int                  dev_inited;
+    int                  lock_inited;
+    int                  running;
+    i64                  next_voice_id;
+} AmalgameAudioMixer;
+
+static void _amaudio_mixer_cb(ma_device* dev, void* output, const void* input, ma_uint32 frames) {
+    (void) input;
+    AmalgameAudioMixer* m = (AmalgameAudioMixer*) dev->pUserData;
+    int16_t* out = (int16_t*) output;
+    if (!m || !m->running) {
+        memset(out, 0, (size_t) frames * sizeof(int16_t));
+        return;
+    }
+
+    ma_mutex_lock(&m->lock);
+
+    /* Sample-by-sample mix. We accumulate in f32 to avoid
+     * int-overflow during 32-voice summation, clip to s16 at
+     * the very end. */
+    for (ma_uint32 f = 0; f < frames; f++) {
+        f32 sum = 0.0f;
+        for (int v = 0; v < AMAUDIO_MIXER_MAX_VOICES; v++) {
+            _amaudio_mixer_voice* vc = &m->voices[v];
+            if (!vc->in_use || vc->paused) continue;
+            if (vc->pos >= vc->n) {
+                if (vc->loop) {
+                    vc->pos = 0;
+                } else {
+                    /* Drained — free the slot. Caller can poll
+                     * SourceCount or call RemoveSource without
+                     * worrying about double-free; in_use=0
+                     * already pruned us here. */
+                    vc->in_use = 0;
+                    free(vc->pcm);
+                    vc->pcm = NULL;
+                    continue;
+                }
+            }
+            sum += (f32) vc->pcm[vc->pos] * (f32) vc->gain;
+            vc->pos++;
+        }
+        if (sum >  32767.0f) sum =  32767.0f;
+        if (sum < -32768.0f) sum = -32768.0f;
+        out[f] = (int16_t) sum;
+    }
+
+    ma_mutex_unlock(&m->lock);
+}
+
+/* Open a default-output device and start a mixer attached to
+ * it. No initial sources — call MixerAddSource to layer in
+ * voices. Returns NULL on device-open failure (LastError
+ * populated; typical headless CI: "no default playback
+ * device"). */
+static inline AmalgameAudioMixer* Amalgame_Audio_MixerStart(i64 sampleRate) {
+    if (sampleRate <= 0) {
+        _amaudio_set_error("MixerStart: bad sampleRate");
+        return NULL;
+    }
+    AmalgameAudioMixer* m = (AmalgameAudioMixer*) calloc(1, sizeof(*m));
+    if (!m) { _amaudio_set_error("MixerStart: OOM"); return NULL; }
+    m->running       = 1;
+    m->next_voice_id = 1;
+
+    if (ma_mutex_init(&m->lock) != MA_SUCCESS) {
+        free(m);
+        _amaudio_set_error("MixerStart: mutex_init failed");
+        return NULL;
+    }
+    m->lock_inited = 1;
+
+    ma_device_config dcfg = ma_device_config_init(ma_device_type_playback);
+    dcfg.playback.format   = ma_format_s16;
+    dcfg.playback.channels = 1;
+    dcfg.sampleRate        = (ma_uint32) sampleRate;
+    dcfg.dataCallback      = _amaudio_mixer_cb;
+    dcfg.pUserData         = m;
+
+    if (ma_device_init(NULL, &dcfg, &m->dev) != MA_SUCCESS) {
+        ma_mutex_uninit(&m->lock);
+        free(m);
+        _amaudio_set_error("MixerStart: device_init failed");
+        return NULL;
+    }
+    m->dev_inited = 1;
+
+    if (ma_device_start(&m->dev) != MA_SUCCESS) {
+        ma_device_uninit(&m->dev);
+        ma_mutex_uninit(&m->lock);
+        free(m);
+        _amaudio_set_error("MixerStart: device_start failed");
+        return NULL;
+    }
+    _amaudio_set_error(NULL);
+    return m;
+}
+
+/* Add a source. Dups the AmalgameList contents into a private
+ * int16 buffer. `loop = 1` wraps the cursor at end-of-buffer
+ * (use for backgrounds / ambient pads); `loop = 0` lets the
+ * voice drain and self-prune. Returns the new voice id, or 0
+ * on failure (mixer full, OOM, null args). */
+static inline i64 Amalgame_Audio_MixerAddSource(AmalgameAudioMixer* m, AmalgameList* samples, f64 gain, code_bool loop) {
+    if (!m || !samples) { _amaudio_set_error("MixerAddSource: null arg"); return 0; }
+    size_t n = 0;
+    int16_t* pcm = _amaudio_pcm_from_buf(samples, &n);
+    if (!pcm || n == 0) {
+        free(pcm);
+        _amaudio_set_error("MixerAddSource: empty samples");
+        return 0;
+    }
+
+    ma_mutex_lock(&m->lock);
+
+    int slot = -1;
+    for (int v = 0; v < AMAUDIO_MIXER_MAX_VOICES; v++) {
+        if (!m->voices[v].in_use) { slot = v; break; }
+    }
+    if (slot < 0) {
+        ma_mutex_unlock(&m->lock);
+        free(pcm);
+        _amaudio_set_error("MixerAddSource: mixer full (32 voices max)");
+        return 0;
+    }
+    i64 vid = m->next_voice_id++;
+    _amaudio_mixer_voice* vc = &m->voices[slot];
+    vc->in_use   = 1;
+    vc->voice_id = vid;
+    vc->pcm      = pcm;
+    vc->n        = (ma_uint64) n;
+    vc->pos      = 0;
+    vc->gain     = gain;
+    vc->paused   = 0;
+    vc->loop     = loop ? 1 : 0;
+
+    ma_mutex_unlock(&m->lock);
+    _amaudio_set_error(NULL);
+    return vid;
+}
+
+/* Find the voice with the given id and call the supplied
+ * mutator under the lock. Returns true if found. */
+static inline int _amaudio_mixer_find_locked(AmalgameAudioMixer* m, i64 voiceId) {
+    for (int v = 0; v < AMAUDIO_MIXER_MAX_VOICES; v++) {
+        if (m->voices[v].in_use && m->voices[v].voice_id == voiceId) return v;
+    }
+    return -1;
+}
+
+static inline code_bool Amalgame_Audio_MixerSetGain(AmalgameAudioMixer* m, i64 voiceId, f64 gain) {
+    if (!m) return 0;
+    ma_mutex_lock(&m->lock);
+    int v = _amaudio_mixer_find_locked(m, voiceId);
+    if (v < 0) { ma_mutex_unlock(&m->lock); return 0; }
+    m->voices[v].gain = gain;
+    ma_mutex_unlock(&m->lock);
+    return 1;
+}
+
+static inline code_bool Amalgame_Audio_MixerSetPaused(AmalgameAudioMixer* m, i64 voiceId, code_bool paused) {
+    if (!m) return 0;
+    ma_mutex_lock(&m->lock);
+    int v = _amaudio_mixer_find_locked(m, voiceId);
+    if (v < 0) { ma_mutex_unlock(&m->lock); return 0; }
+    m->voices[v].paused = paused ? 1 : 0;
+    ma_mutex_unlock(&m->lock);
+    return 1;
+}
+
+static inline code_bool Amalgame_Audio_MixerRemoveSource(AmalgameAudioMixer* m, i64 voiceId) {
+    if (!m) return 0;
+    ma_mutex_lock(&m->lock);
+    int v = _amaudio_mixer_find_locked(m, voiceId);
+    if (v < 0) { ma_mutex_unlock(&m->lock); return 0; }
+    _amaudio_mixer_voice* vc = &m->voices[v];
+    vc->in_use = 0;
+    free(vc->pcm);
+    vc->pcm = NULL;
+    ma_mutex_unlock(&m->lock);
+    return 1;
+}
+
+/* How many voices are currently alive (not drained, not
+ * removed). Use this to decide when to add more layers vs.
+ * waiting for old ones to finish. */
+static inline i64 Amalgame_Audio_MixerSourceCount(AmalgameAudioMixer* m) {
+    if (!m) return 0;
+    i64 count = 0;
+    ma_mutex_lock(&m->lock);
+    for (int v = 0; v < AMAUDIO_MIXER_MAX_VOICES; v++) {
+        if (m->voices[v].in_use) count++;
+    }
+    ma_mutex_unlock(&m->lock);
+    return count;
+}
+
+/* Stop the mixer, uninit the device, free every voice's PCM
+ * buffer, free the mixer. Safe to call once per mixer. */
+static inline code_bool Amalgame_Audio_MixerStop(AmalgameAudioMixer* m) {
+    if (!m) { _amaudio_set_error("MixerStop: null mixer"); return 0; }
+    m->running = 0;
+    if (m->dev_inited) {
+        ma_device_stop(&m->dev);
+        ma_device_uninit(&m->dev);
+        m->dev_inited = 0;
+    }
+    /* Voices are now safe to drain on the main thread — the
+     * audio thread has been stopped. */
+    for (int v = 0; v < AMAUDIO_MIXER_MAX_VOICES; v++) {
+        if (m->voices[v].pcm) {
+            free(m->voices[v].pcm);
+            m->voices[v].pcm = NULL;
+        }
+        m->voices[v].in_use = 0;
+    }
+    if (m->lock_inited) {
+        ma_mutex_uninit(&m->lock);
+        m->lock_inited = 0;
+    }
+    free(m);
+    _amaudio_set_error(NULL);
+    return 1;
 }
 
 #endif /* AMALGAME_AUDIO_H */

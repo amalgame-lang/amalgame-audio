@@ -15,7 +15,7 @@
 #   Diag:         LastError
 #
 # Sample format: 16-bit signed PCM mono. Multi-channel + 32-bit
-# float pipelines are v0.5+.
+# float pipelines are v0.6+.
 #
 # Surface (v0.2 additions):
 #   Multi-format load:  Load / LoadMp3 / LoadFlac / LoadOgg
@@ -30,23 +30,29 @@
 #                        PlayStop / PlayIsActive / PlayIsPaused /
 #                        PlaySampleCount
 #
-# Out of scope (v0.5+):
+# Surface (v0.5 additions):
+#   Live mixer:  MixerStart / MixerAddSource / MixerSetGain /
+#                MixerSetPaused / MixerRemoveSource /
+#                MixerSourceCount / MixerStop
+#
+# Out of scope (v0.6+):
+#   - MIDI in/out (file IO + device IO) — coming in v0.6
 #   - Real-time synthesis via user-provided callback
 #   - Pitch shift / time stretch / FFT analysis
-#   - Mixing graph / spatial audio / HRTF
-#   - Multi-channel pipelines (stereo / surround) — v0.4 keeps
+#   - Spatial audio / HRTF (mixer itself is mono, no panning yet)
+#   - Multi-channel pipelines (stereo / surround) — v0.5 keeps
 #     mono int16 as the canonical buffer type
 #
 # Installation:
 #
 #   amc package add audio                                # via index
-#   amc package add github.com/amalgame-lang/amalgame-audio@v0.4.0
+#   amc package add github.com/amalgame-lang/amalgame-audio@v0.5.0
 
 [package]
 name              = "amalgame-audio"
-version           = "0.4.0"
+version           = "0.5.0"
 license           = "Apache-2.0"
-description       = "Audio synth + streaming playback + capture + multi-format decode (WAV/MP3/FLAC/OGG) for Amalgame — miniaudio (public domain), vendored."
+description       = "Audio synth + streaming playback + capture + live mixer + multi-format decode (WAV/MP3/FLAC/OGG) for Amalgame — miniaudio (public domain), vendored."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.5.4"
 schema-version    = 1
@@ -111,5 +117,14 @@ PlayStop           = { returns = "code_bool" }
 PlayIsActive       = { returns = "code_bool" }
 PlayIsPaused       = { returns = "code_bool" }
 PlaySampleCount    = { returns = "i64" }
+
+# v0.5 — live AudioMixer (multi-source streaming)
+MixerStart         = { returns = "AmalgameAudioMixer*" }
+MixerAddSource     = { returns = "i64" }
+MixerSetGain       = { returns = "code_bool" }
+MixerSetPaused     = { returns = "code_bool" }
+MixerRemoveSource  = { returns = "code_bool" }
+MixerSourceCount   = { returns = "i64" }
+MixerStop          = { returns = "code_bool" }
 
 [dependencies]

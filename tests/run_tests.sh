@@ -74,7 +74,7 @@ echo ""
 # ── Stage a fake cache pointing at the working tree ──
 FAKE_CACHE="$BUILD_DIR/cache"
 PKG_GIT="github.com/amalgame-lang/amalgame-audio"
-PKG_TAG="${PKG_TAG:-v0.4.0}"
+PKG_TAG="${PKG_TAG:-v0.5.0}"
 FAKE_SHA="deadbeefcafebabe0000000000000000000000ab"
 SHORT_SHA="${FAKE_SHA:0:8}"
 PKG_CACHE_DIR="$FAKE_CACHE/$PKG_GIT/${PKG_TAG}_${SHORT_SHA}"
@@ -175,6 +175,19 @@ echo "── Audio v0.4 (streaming playback) ─────────"
 run_test "PlayStart active handle"   "[PASS] PlayStart returns active handle"   "[SKIP] PlayStart"
 run_test "PlayPause/Resume toggle"   "[PASS] PlayPause/Resume toggles flag"     "[SKIP] PlayPause/Resume"
 run_test "PlayStop returns true"     "[PASS] PlayStop returns true on live handle" "[SKIP] PlayStop"
+
+echo ""
+echo "── Audio v0.5 (live mixer) ─────────────────"
+# Same playback-device gating. On a real device these layer
+# two 0.5 s sine tones at different frequencies, tweak gain,
+# pause/remove voices, and stop the mixer — exercises the
+# full state-machine surface without any timing dependency.
+run_test "MixerStart fresh mixer"     "[PASS] MixerStart fresh mixer has 0 sources"   "[SKIP] MixerStart fresh mixer"
+run_test "MixerAddSource × 2"         "[PASS] MixerAddSource × 2 → 2 voices"          "[SKIP] MixerAddSource × 2"
+run_test "MixerSetGain/SetPaused"     "[PASS] MixerSetGain/SetPaused on live voices"  "[SKIP] MixerSetGain/SetPaused"
+run_test "MixerRemoveSource"          "[PASS] MixerRemoveSource decrements count"     "[SKIP] MixerRemoveSource"
+run_test "MixerSetGain stale id"      "[PASS] MixerSetGain on stale voice id is false" "[SKIP] MixerSetGain stale id"
+run_test "MixerStop returns true"     "[PASS] MixerStop returns true"                 "[SKIP] MixerStop"
 
 echo ""
 echo "────────────────────────────────────────────"
