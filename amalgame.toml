@@ -51,27 +51,50 @@
 #     - per-note release envelope (30 ms ramp) — no click on NoteOff
 #     - pitch-bend rendering, ±2 semitones (GM default)
 #
-# Out of scope (v0.8+):
+# Surface (v0.8 additions):
+#   Lossless splice:     WavSplice / Mp3FrameSplice
+#                         (cut+concatenate segments by ms range,
+#                          in caller-chosen output order — raw
+#                          PCM/frame byte copy, no decode/reencode.
+#                          Mp3FrameSplice drops the first frame of
+#                          every segment but the first as a bit-
+#                          reservoir mitigation — see the header
+#                          doc comment above the v0.8 section.)
+#   Native-channel load: LoadNativeChannels (no forced downmix,
+#                         unlike Load/LoadMp3/LoadFlac/LoadOgg)
+#   Resample:             Resample (mono, linear interpolation)
+#   Noise suppression:    DenoiseVoice (RNNoise v0.1.1, vendored —
+#                          mono 48kHz int16 in/out, no channel/rate
+#                          awareness of its own — see NOTICE.md)
+#   Opus encode:           SaveAsOpusStereo / SaveAsOpusMono (RFC
+#                          7845 Ogg Opus, libopus v1.5.2 + libogg,
+#                          both vendored — sampleRate must be 48000)
+#
+# Out of scope (v0.9+):
 #   - MIDI device IO (live keyboards, hardware synths) —
 #     needs portable cross-platform wrapper (ALSA seq on
 #     Linux, CoreMIDI on macOS, winmm on Windows)
 #   - Real-time synthesis via user-provided callback
 #   - Pitch shift / time stretch / FFT analysis
 #   - Spatial audio / HRTF (mixer is mono, no panning yet)
-#   - Multi-channel pipelines (surround / 32-bit float)
+#   - Multi-channel pipelines beyond stereo (surround / 32-bit float)
 #   - MIDI render: CC / ProgramChange / ChanPressure / poly-
 #     aftertouch (accepted on read, ignored by the synth)
+#   - Lossless splice for FLAC/OGG (MP3 and WAV only for now —
+#     covers the realistic voice-recorder upload formats; a
+#     decode+reencode fallback is the caller's job for other
+#     formats, e.g. via LoadNativeChannels + SaveAsWav*)
 #
 # Installation:
 #
 #   amc package add audio                                # via index
-#   amc package add github.com/amalgame-lang/amalgame-audio@v0.7.0
+#   amc package add github.com/amalgame-lang/amalgame-audio@v0.8.0
 
 [package]
 name              = "amalgame-audio"
-version           = "0.7.0"
+version           = "0.8.0"
 license           = "Apache-2.0"
-description       = "Audio synth + streaming playback + capture + live mixer + multi-format decode + MIDI SMF (render w/ envelope + pitch-bend) + stereo helpers for Amalgame — miniaudio (public domain), vendored."
+description       = "Audio synth + streaming playback + capture + live mixer + multi-format decode + MIDI SMF + stereo helpers + lossless MP3/WAV splice + RNNoise denoise + Opus encode for Amalgame — miniaudio (public domain) + RNNoise + libopus + libogg (BSD-3-Clause), vendored."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.5.4"
 schema-version    = 1
@@ -81,17 +104,66 @@ class     = "Audio"
 header    = "runtime/Amalgame_Audio.h"
 namespace = "Amalgame.Audio"
 
-# miniaudio implementation, materialised in one TU.
-# Precompiled once at `amc package add` time; reused across
-# every subsequent build via the platform-keyed cache.
+# SIX vendored-library TUs — amc precompiles each `sources` entry
+# into its OWN separate .o (one per array element, not one combined
+# .o for the whole array — see add_cmd.am `PrecompilePackage`). A
+# consumer's build script that falls back to "grab the first .o
+# found" when no `.a` archive exists (a documented workaround for
+# this package's precompile layout, see e.g. CMSPress's build.sh)
+# MUST be updated to grab and link ALL matching .o files, not just
+# one — otherwise some library's symbols silently go missing at
+# link time.
+#
+# ma_impl.c: miniaudio implementation, materialised in one TU.
 # v0.2: MP3/FLAC/Vorbis decoders now enabled (.o grows from
 # ~250 KB → ~1 MB).
-sources    = ["runtime/vendor/ma_impl.c"]
+#
+# rnnoise_impl.c (v0.8): unity build of the 6 vendored RNNoise
+# v0.1.1 sources (runtime/vendor/rnnoise/) — see its own header
+# comment for why v0.1.1 over current upstream.
+#
+# opus_impl.c / opus_celt_encoder_impl.c / opus_celt_decoder_impl.c
+# (v0.8): libopus v1.5.2 (runtime/vendor/opus/), split 3 ways —
+# celt_encoder.c/celt_decoder.c compiled standalone because
+# unity-building them with the other ~135 opus/silk/celt files
+# trips a real declaration mismatch (celt.h's OPUS_CUSTOM_NOSTATIC
+# macro resolving differently by inclusion order — see opus_impl.c's
+# header comment). **Important**: `amc package add`'s own precompile
+# step (add_cmd.am `PrecompilePackage`) only ever passes
+# `-I<amcRuntime>` + `-I<every other cached package's runtime dir>`
+# + this `cflags` string — it does NOT run from this package's own
+# directory and does NOT auto-add package-internal subdirectory
+# `-I`s, so a *relative* `-Iopus/include` here would resolve against
+# an unpredictable cwd. Rather than rely on that, every opus/silk/
+# celt/src header libopus's own sources need across directories has
+# been PHYSICALLY DUPLICATED into every directory that unity-builds
+# a file needing it (verified empirically: compiles clean with only
+# `-I.` from this directory, matching amc's real precompile
+# invocation exactly, not just a Makefile-based dev build). If
+# upstream libopus is ever re-vendored, this duplication has to be
+# redone the same way — don't just drop in a fresh silk/celt/src/
+# include/ tree without it.
+#
+# ogg_impl.c (v0.8): libogg (runtime/vendor/ogg/ + libogg-src/) —
+# the Ogg container muxer. Opus audio must live inside an Ogg
+# container to be a valid, browser-playable `.opus` file (RFC 7845)
+# — libopus alone only emits raw codec packets.
+sources    = [
+    "runtime/vendor/ma_impl.c",
+    "runtime/vendor/rnnoise_impl.c",
+    "runtime/vendor/opus_impl.c",
+    "runtime/vendor/opus_celt_encoder_impl.c",
+    "runtime/vendor/opus_celt_decoder_impl.c",
+    "runtime/vendor/ogg_impl.c",
+]
 precompile = true
 
 # miniaudio is a single, large header; -O2 keeps decode/encode
 # hot paths tight. -w stays under amc's own quieter flag.
-cflags     = "-O2"
+# -DOPUS_BUILD -DUSE_ALLOCA: required by libopus's own sources
+# (matches its portable Makefile.unix exactly) — harmless no-ops
+# for the other 4 TUs, which don't look at either macro.
+cflags     = "-O2 -DOPUS_BUILD -DUSE_ALLOCA"
 
 # Platform link flags — miniaudio defers to OS-native libs at
 # runtime. amc forwards these to the user's gcc invocation.
@@ -159,5 +231,14 @@ MonoToStereo       = { returns = "AmalgameList*" }
 StereoToMono       = { returns = "AmalgameList*" }
 SaveAsWavStereo    = { returns = "code_bool" }
 LoadWavStereo      = { returns = "AmalgameList*" }
+
+# v0.8 — lossless splice + native-channel decode + resample
+WavSplice            = { returns = "code_bool" }
+Mp3FrameSplice       = { returns = "code_bool" }
+LoadNativeChannels   = { returns = "AmalgameList*" }
+Resample             = { returns = "AmalgameList*" }
+DenoiseVoice         = { returns = "AmalgameList*" }
+SaveAsOpusStereo     = { returns = "code_bool" }
+SaveAsOpusMono       = { returns = "code_bool" }
 
 [dependencies]

@@ -101,6 +101,29 @@
  *   (5 ms / 30 ms) so NoteOn/Off no longer click, plus pitch-
  *   bend rendering with ±2-semitone range (GM default).
  *
+ *   ── v0.8 — lossless splice + native-channel decode + resample ──
+ *   Audio.WavSplice(srcPath, segmentsMs, outPath)      -> bool
+ *   Audio.Mp3FrameSplice(srcPath, segmentsMs, outPath) -> bool
+ *       Cut+concatenate segments (ms ranges, in OUTPUT order) out
+ *       of a source file with no decode/reencode — raw PCM/frame
+ *       bytes copied as-is. segmentsMs is a flat List<int> of
+ *       [start0,end0,start1,end1,...] pairs.
+ *   Audio.LoadNativeChannels(path)             -> List<int>
+ *       Like Load, but preserves the source's real channel count
+ *       instead of downmixing to mono (interleaved if stereo).
+ *   Audio.Resample(samples, srcRate, dstRate)  -> List<int>
+ *       Linear-interpolation resample of a mono buffer.
+ *   Audio.DenoiseVoice(samples)                -> List<int>
+ *       RNNoise background-noise suppression. Input MUST be mono
+ *       int16 at 48kHz (resample first if needed) — mono/rate are
+ *       the caller's job, same division of labour as Resample vs.
+ *       RNNoise itself, which has no channel/rate concept.
+ *   Audio.SaveAsOpusStereo(interleaved, sr, path) -> bool
+ *   Audio.SaveAsOpusMono(samples, sr, path)       -> bool
+ *       Encode + mux into a standard, browser-playable Ogg Opus
+ *       (.opus) file (RFC 7845) via libopus + libogg, both
+ *       vendored. sr MUST be 48000 — resample first if needed.
+ *
  * Threading: synthesis / transformation are pure (return new
  * buffers). Blocking `Play` / `Record` hold the calling thread
  * until the device drains / fills. Streaming `PlayStart` and
@@ -120,6 +143,9 @@
 #include "_runtime.h"
 #include "Amalgame_Collections.h"
 #include "miniaudio.h"
+#include "rnnoise/rnnoise.h"
+#include "opus/include/opus.h"
+#include "ogg/ogg.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2117,6 +2143,743 @@ static inline AmalgameList* Amalgame_Audio_LoadWavStereo(code_string path) {
     free(pcm);
     _amaudio_set_error(NULL);
     return out;
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  v0.8 — lossless splice + native-channel decode + resample
+ * ═══════════════════════════════════════════════════════
+ *
+ * Built for byte-accurate audio trimming/reordering (CMSPress
+ * podcast editor): cut multiple segments out of a source file and
+ * concatenate them in a chosen order, without decode+reencode —
+ * MP3 frames / WAV PCM ranges are copied as raw bytes, so quality
+ * and file size are untouched for whatever is kept.
+ *
+ *   Audio.WavSplice(srcPath, segmentsMs, outPath)      -> bool
+ *   Audio.Mp3FrameSplice(srcPath, segmentsMs, outPath) -> bool
+ *       segmentsMs is a flat List<int> of [start0,end0,
+ *       start1,end1,...] millisecond pairs, IN OUTPUT ORDER —
+ *       segments don't need to be given in chronological source
+ *       order, which is how reordering falls out for free.
+ *
+ *   Audio.LoadNativeChannels(path)  -> List<int>
+ *       Like Load, but does NOT downmix — returns interleaved
+ *       samples at the source's real channel count (mono stays
+ *       mono, stereo stays interleaved L0 R0 L1 R1...). Check
+ *       Audio.ChannelCountOf(path) to know which you got.
+ *
+ *   Audio.Resample(samples, srcRate, dstRate) -> List<int>
+ *       Linear-interpolation resample of a MONO buffer. For a
+ *       stereo pipeline, de-interleave and call twice (once per
+ *       channel) — this function itself has no channel concept,
+ *       same division of labour as RNNoise (also mono-only).
+ *
+ * MP3 bit-reservoir note: Layer III frames can borrow bits from
+ * the previous frame's reservoir. Cutting at a frame boundary can
+ * therefore make the first retained frame after a cut reference
+ * bytes that were just discarded, causing a brief decode glitch.
+ * Mp3FrameSplice mitigates this by dropping the first frame of
+ * every segment except the very first output segment (~26 ms
+ * lost per internal cut point, not the whole file) rather than
+ * risking audible garbage — the standard trade-off used by
+ * frame-accurate MP3 cutters.
+ */
+
+/* ── WavSplice ──────────────────────────────────────────── */
+
+/* Cut segments (by ms range) out of a WAV file and concatenate
+ * them into a new WAV, at the source's native format/channels/
+ * rate — pure PCM-frame copy, no resampling or channel mixing.
+ * segmentsMs = flat [start0,end0,start1,end1,...] pairs in
+ * output order. Invalid/empty ranges (end <= start, or entirely
+ * past EOF) are silently skipped rather than failing the whole
+ * call. */
+static inline code_bool Amalgame_Audio_WavSplice(
+        code_string sourcePath, AmalgameList* segmentsMs, code_string outPath) {
+    if (!sourcePath || !outPath || !segmentsMs) {
+        _amaudio_set_error("WavSplice: null arg");
+        return 0;
+    }
+    size_t nSeg = (size_t) AmalgameList_count(segmentsMs);
+    if (nSeg == 0 || nSeg % 2 != 0) {
+        _amaudio_set_error("WavSplice: segmentsMs must have an even, non-zero length");
+        return 0;
+    }
+
+    /* channels=0, sampleRate=0 → keep the source's native format
+     * exactly; this is a trim/reorder, never a transform. */
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 0, 0);
+    ma_decoder dec;
+    if (ma_decoder_init_file(sourcePath, &cfg, &dec) != MA_SUCCESS) {
+        _amaudio_set_error("WavSplice: ma_decoder_init_file failed");
+        return 0;
+    }
+    ma_uint32 channels = dec.outputChannels;
+    ma_uint32 sampleRate = dec.outputSampleRate;
+    ma_uint64 totalFrames = 0;
+    if (ma_decoder_get_length_in_pcm_frames(&dec, &totalFrames) != MA_SUCCESS) {
+        ma_decoder_uninit(&dec);
+        _amaudio_set_error("WavSplice: get_length failed");
+        return 0;
+    }
+
+    ma_encoder_config ecfg = ma_encoder_config_init(
+        ma_encoding_format_wav, ma_format_s16, channels, sampleRate);
+    ma_encoder enc;
+    if (ma_encoder_init_file(outPath, &ecfg, &enc) != MA_SUCCESS) {
+        ma_decoder_uninit(&dec);
+        _amaudio_set_error("WavSplice: ma_encoder_init_file failed");
+        return 0;
+    }
+
+#define AMAUDIO_SPLICE_CHUNK_FRAMES 65536
+    int16_t* chunk = (int16_t*) malloc(
+        (size_t) AMAUDIO_SPLICE_CHUNK_FRAMES * channels * sizeof(int16_t));
+    if (!chunk) {
+        ma_encoder_uninit(&enc);
+        ma_decoder_uninit(&dec);
+        _amaudio_set_error("WavSplice: OOM");
+        return 0;
+    }
+
+    int ok = 1;
+    int wroteAny = 0;
+    for (size_t s = 0; s + 1 < nSeg && ok; s += 2) {
+        i64 startMs = (i64) (intptr_t) AmalgameList_get(segmentsMs, (i64) s);
+        i64 endMs   = (i64) (intptr_t) AmalgameList_get(segmentsMs, (i64) (s + 1));
+        if (startMs < 0) startMs = 0;
+        if (endMs <= startMs) continue;
+
+        ma_uint64 startFrame = (ma_uint64) ((double) startMs * (double) sampleRate / 1000.0);
+        ma_uint64 endFrame   = (ma_uint64) ((double) endMs   * (double) sampleRate / 1000.0);
+        if (startFrame > totalFrames) startFrame = totalFrames;
+        if (endFrame   > totalFrames) endFrame   = totalFrames;
+        if (endFrame <= startFrame) continue;
+
+        if (ma_decoder_seek_to_pcm_frame(&dec, startFrame) != MA_SUCCESS) { ok = 0; break; }
+        ma_uint64 remaining = endFrame - startFrame;
+        while (remaining > 0 && ok) {
+            ma_uint64 want = remaining < AMAUDIO_SPLICE_CHUNK_FRAMES
+                ? remaining : (ma_uint64) AMAUDIO_SPLICE_CHUNK_FRAMES;
+            ma_uint64 got = 0;
+            if (ma_decoder_read_pcm_frames(&dec, chunk, want, &got) != MA_SUCCESS || got == 0) {
+                ok = 0; break;
+            }
+            ma_uint64 written = 0;
+            if (ma_encoder_write_pcm_frames(&enc, chunk, got, &written) != MA_SUCCESS
+                    || written != got) {
+                ok = 0; break;
+            }
+            wroteAny = 1;
+            remaining -= got;
+        }
+    }
+    free(chunk);
+#undef AMAUDIO_SPLICE_CHUNK_FRAMES
+    ma_encoder_uninit(&enc);
+    ma_decoder_uninit(&dec);
+
+    if (!ok || !wroteAny) {
+        _amaudio_set_error("WavSplice: no valid segments written");
+        return 0;
+    }
+    _amaudio_set_error(NULL);
+    return 1;
+}
+
+/* ── Mp3FrameSplice ─────────────────────────────────────── */
+
+typedef struct {
+    long   offset;       /* byte offset of the frame header in the file */
+    int    length;       /* frame length in bytes, header included */
+    double timestampMs;  /* cumulative playback position at frame start */
+} _amaudio_mp3_frame;
+
+typedef struct {
+    _amaudio_mp3_frame* frames;
+    size_t count;
+    size_t cap;
+} _amaudio_mp3_index;
+
+/* MPEG1/MPEG2/MPEG2.5 Layer III bitrate tables (kbps). Index 0 =
+ * "free" bitrate (no fixed frame-length formula — rejected, it's
+ * exotic enough in the wild not to be worth the extra parsing
+ * path), 15 = reserved/invalid. MPEG2 and MPEG2.5 share one
+ * table per the spec. */
+static const int _amaudio_mp3_bitrate_v1l3[16] = {
+    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0
+};
+static const int _amaudio_mp3_bitrate_v2l3[16] = {
+    0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0
+};
+static const int _amaudio_mp3_samplerate_v1[4]  = { 44100, 48000, 32000, 0 };
+static const int _amaudio_mp3_samplerate_v2[4]  = { 22050, 24000, 16000, 0 };
+static const int _amaudio_mp3_samplerate_v25[4] = { 11025, 12000, 8000, 0 };
+
+/* Parse a 4-byte MP3 frame header. Returns 1 and fills the out
+ * params on a syntactically valid Layer III header (I/II are all
+ * but extinct since the mid-90s, not supported), 0 otherwise —
+ * caller treats 0 as "not a frame here, stop indexing" since a
+ * well-formed MP3 stream has frames back-to-back with no gaps. */
+static inline int _amaudio_mp3_parse_header(
+        const unsigned char* hdr, int* frameLen, int* sampleRate,
+        int* samplesPerFrame, int* channels) {
+    if (hdr[0] != 0xFF || (hdr[1] & 0xE0) != 0xE0) return 0;
+    int verBits   = (hdr[1] >> 3) & 0x03;   /* 00=v2.5 01=rsvd 10=v2 11=v1 */
+    int layerBits = (hdr[1] >> 1) & 0x03;   /* 01=Layer III */
+    if (verBits == 1 || layerBits != 1) return 0;
+    int brIdx    = (hdr[2] >> 4) & 0x0F;
+    int srIdx    = (hdr[2] >> 2) & 0x03;
+    int padding  = (hdr[2] >> 1) & 0x01;
+    int chMode   = (hdr[3] >> 6) & 0x03;
+    if (brIdx == 0 || brIdx == 15 || srIdx == 3) return 0;
+
+    int kbps, sr, spf;
+    if (verBits == 3) {           /* MPEG1 */
+        kbps = _amaudio_mp3_bitrate_v1l3[brIdx];
+        sr   = _amaudio_mp3_samplerate_v1[srIdx];
+        spf  = 1152;
+    } else if (verBits == 2) {    /* MPEG2 */
+        kbps = _amaudio_mp3_bitrate_v2l3[brIdx];
+        sr   = _amaudio_mp3_samplerate_v2[srIdx];
+        spf  = 576;
+    } else {                      /* MPEG2.5 */
+        kbps = _amaudio_mp3_bitrate_v2l3[brIdx];
+        sr   = _amaudio_mp3_samplerate_v25[srIdx];
+        spf  = 576;
+    }
+    if (kbps == 0 || sr == 0) return 0;
+
+    int coeff = (verBits == 3) ? 144 : 72;
+    int len = (coeff * kbps * 1000) / sr + padding;
+    if (len < 4) return 0;
+
+    *frameLen = len;
+    *sampleRate = sr;
+    *samplesPerFrame = spf;
+    *channels = (chMode == 3) ? 1 : 2;
+    return 1;
+}
+
+/* Skip a leading ID3v2 tag if present. Returns the byte offset
+ * where frame scanning should start (0 if no tag). File position
+ * on return is undefined — callers always fseek before use. */
+static inline long _amaudio_mp3_skip_id3v2(FILE* f) {
+    unsigned char hdr[10];
+    if (fread(hdr, 1, 10, f) != 10 || hdr[0] != 'I' || hdr[1] != 'D' || hdr[2] != '3') {
+        return 0;
+    }
+    long size = ((long) (hdr[6] & 0x7F) << 21) | ((long) (hdr[7] & 0x7F) << 14)
+              | ((long) (hdr[8] & 0x7F) << 7)  | ((long) (hdr[9] & 0x7F));
+    int footer = (hdr[5] & 0x10) ? 10 : 0;
+    return 10 + size + footer;
+}
+
+static inline int _amaudio_mp3_index_push(_amaudio_mp3_index* idx, long offset, int len, double ts) {
+    if (idx->count == idx->cap) {
+        size_t newCap = idx->cap == 0 ? 1024 : idx->cap * 2;
+        _amaudio_mp3_frame* grown = (_amaudio_mp3_frame*) realloc(
+            idx->frames, newCap * sizeof(_amaudio_mp3_frame));
+        if (!grown) return 0;
+        idx->frames = grown;
+        idx->cap = newCap;
+    }
+    idx->frames[idx->count].offset = offset;
+    idx->frames[idx->count].length = len;
+    idx->frames[idx->count].timestampMs = ts;
+    idx->count++;
+    return 1;
+}
+
+/* Build a frame index for `path`: byte offset + length + cumulative
+ * timestamp for every real audio frame, in file order. The Xing/
+ * Info/VBRI header "frame" (encoder metadata sitting in the first
+ * syntactically-valid frame slot) is detected and excluded — it
+ * isn't audio and would otherwise skew timestamp 0. Returns 1 with
+ * idx populated (caller frees idx->frames) on success, 0 if the
+ * file can't be opened or contains no valid frames at all. */
+static int _amaudio_mp3_build_index(const char* path, _amaudio_mp3_index* idx) {
+    memset(idx, 0, sizeof(*idx));
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+
+    long pos = _amaudio_mp3_skip_id3v2(f);
+    fseek(f, 0, SEEK_END);
+    long fileSize = ftell(f);
+
+    double tsMs = 0.0;
+    int firstFrame = 1;
+    while (pos + 4 <= fileSize) {
+        unsigned char hdr[4];
+        fseek(f, pos, SEEK_SET);
+        if (fread(hdr, 1, 4, f) != 4) break;
+        int frameLen, sr, spf, ch;
+        if (!_amaudio_mp3_parse_header(hdr, &frameLen, &sr, &spf, &ch)) break;
+        if (pos + frameLen > fileSize) break;
+
+        if (firstFrame) {
+            firstFrame = 0;
+            long searchLen = frameLen - 4 < 64 ? frameLen - 4 : 64;
+            unsigned char buf[64];
+            fseek(f, pos + 4, SEEK_SET);
+            size_t got = fread(buf, 1, (size_t) (searchLen > 0 ? searchLen : 0), f);
+            int isHeaderFrame = 0;
+            for (size_t k = 0; k + 4 <= got; k++) {
+                if ((buf[k]=='X'&&buf[k+1]=='i'&&buf[k+2]=='n'&&buf[k+3]=='g') ||
+                    (buf[k]=='I'&&buf[k+1]=='n'&&buf[k+2]=='f'&&buf[k+3]=='o') ||
+                    (buf[k]=='V'&&buf[k+1]=='B'&&buf[k+2]=='R'&&buf[k+3]=='I')) {
+                    isHeaderFrame = 1;
+                    break;
+                }
+            }
+            if (isHeaderFrame) { pos += frameLen; continue; }
+        }
+
+        if (!_amaudio_mp3_index_push(idx, pos, frameLen, tsMs)) {
+            fclose(f);
+            free(idx->frames);
+            memset(idx, 0, sizeof(*idx));
+            return 0;
+        }
+        tsMs += (double) spf * 1000.0 / (double) sr;
+        pos += frameLen;
+    }
+    fclose(f);
+    return idx->count > 0;
+}
+
+/* First frame index whose timestampMs >= targetMs (idx->count if
+ * targetMs is past the last frame). Frames are in monotonic file/
+ * time order, so a binary search is valid. */
+static size_t _amaudio_mp3_find_frame(_amaudio_mp3_index* idx, double targetMs) {
+    size_t lo = 0, hi = idx->count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (idx->frames[mid].timestampMs < targetMs) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+/* Cut segments (by ms range, against the ORIGINAL file's timeline)
+ * out of an MP3 and concatenate them into a new MP3, copying raw
+ * frame bytes — no decode/reencode, so bitrate/quality/size of
+ * whatever is kept are exactly the source's. segmentsMs = flat
+ * [start0,end0,start1,end1,...] pairs IN OUTPUT ORDER (segments
+ * need not be chronological — that's how reordering falls out).
+ * See the bit-reservoir note above the v0.8 section header for
+ * why the first frame of every segment but the first is dropped. */
+static inline code_bool Amalgame_Audio_Mp3FrameSplice(
+        code_string sourcePath, AmalgameList* segmentsMs, code_string outPath) {
+    if (!sourcePath || !outPath || !segmentsMs) {
+        _amaudio_set_error("Mp3FrameSplice: null arg");
+        return 0;
+    }
+    size_t nSeg = (size_t) AmalgameList_count(segmentsMs);
+    if (nSeg == 0 || nSeg % 2 != 0) {
+        _amaudio_set_error("Mp3FrameSplice: segmentsMs must have an even, non-zero length");
+        return 0;
+    }
+
+    _amaudio_mp3_index idx;
+    if (!_amaudio_mp3_build_index(sourcePath, &idx)) {
+        _amaudio_set_error("Mp3FrameSplice: no valid MP3 frames found in source");
+        return 0;
+    }
+
+    FILE* src = fopen(sourcePath, "rb");
+    if (!src) {
+        free(idx.frames);
+        _amaudio_set_error("Mp3FrameSplice: cannot reopen source");
+        return 0;
+    }
+    FILE* dst = fopen(outPath, "wb");
+    if (!dst) {
+        fclose(src);
+        free(idx.frames);
+        _amaudio_set_error("Mp3FrameSplice: cannot open outPath");
+        return 0;
+    }
+
+#define AMAUDIO_MP3_COPY_CHUNK 65536
+    unsigned char* buf = (unsigned char*) malloc(AMAUDIO_MP3_COPY_CHUNK);
+    int ok = buf != NULL;
+    int outputSegmentIdx = 0;
+
+    for (size_t s = 0; s + 1 < nSeg && ok; s += 2) {
+        i64 startMs = (i64) (intptr_t) AmalgameList_get(segmentsMs, (i64) s);
+        i64 endMs   = (i64) (intptr_t) AmalgameList_get(segmentsMs, (i64) (s + 1));
+        if (startMs < 0) startMs = 0;
+        if (endMs <= startMs) continue;
+
+        size_t startFrame = _amaudio_mp3_find_frame(&idx, (double) startMs);
+        size_t endFrame   = _amaudio_mp3_find_frame(&idx, (double) endMs);
+        if (startFrame >= idx.count) continue;
+        if (endFrame > idx.count) endFrame = idx.count;
+        if (endFrame <= startFrame) continue;
+
+        /* Bit-reservoir mitigation — see doc comment. Only if the
+         * segment has more than one frame left to give up. */
+        if (outputSegmentIdx > 0 && endFrame - startFrame > 1) startFrame++;
+        outputSegmentIdx++;
+
+        long copyStart = idx.frames[startFrame].offset;
+        long copyEnd   = idx.frames[endFrame - 1].offset + idx.frames[endFrame - 1].length;
+        long remaining = copyEnd - copyStart;
+        if (fseek(src, copyStart, SEEK_SET) != 0) { ok = 0; break; }
+        while (remaining > 0) {
+            long want = remaining < AMAUDIO_MP3_COPY_CHUNK ? remaining : AMAUDIO_MP3_COPY_CHUNK;
+            size_t got = fread(buf, 1, (size_t) want, src);
+            if (got == 0) { ok = 0; break; }
+            if (fwrite(buf, 1, got, dst) != got) { ok = 0; break; }
+            remaining -= (long) got;
+        }
+    }
+    free(buf);
+#undef AMAUDIO_MP3_COPY_CHUNK
+    fclose(dst);
+    fclose(src);
+    free(idx.frames);
+
+    if (!ok || outputSegmentIdx == 0) {
+        remove(outPath);
+        _amaudio_set_error("Mp3FrameSplice: no valid segments written");
+        return 0;
+    }
+    _amaudio_set_error(NULL);
+    return 1;
+}
+
+/* ── LoadNativeChannels ─────────────────────────────────── */
+
+/* Like Load, but does NOT downmix — returns interleaved samples
+ * at the source's real channel count (mono input stays a flat
+ * mono buffer, stereo input comes back as L0 R0 L1 R1...). Check
+ * Audio.ChannelCountOf(path) first to know which layout to expect.
+ * Multi-format auto-detect via magic bytes, same as Load/LoadMp3/
+ * LoadFlac/LoadOgg. */
+static inline AmalgameList* Amalgame_Audio_LoadNativeChannels(code_string path) {
+    if (!path) { _amaudio_set_error("LoadNativeChannels: null path"); return AmalgameList_new(); }
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 0, 0);
+    ma_decoder dec;
+    if (ma_decoder_init_file(path, &cfg, &dec) != MA_SUCCESS) {
+        _amaudio_set_error("LoadNativeChannels: ma_decoder_init_file failed");
+        return AmalgameList_new();
+    }
+    ma_uint32 channels = dec.outputChannels;
+    ma_uint64 frames = 0;
+    if (ma_decoder_get_length_in_pcm_frames(&dec, &frames) != MA_SUCCESS) {
+        ma_decoder_uninit(&dec);
+        _amaudio_set_error("LoadNativeChannels: get_length failed");
+        return AmalgameList_new();
+    }
+    int16_t* pcm = (int16_t*) malloc((size_t) frames * channels * sizeof(int16_t));
+    if (!pcm) {
+        ma_decoder_uninit(&dec);
+        _amaudio_set_error("LoadNativeChannels: OOM");
+        return AmalgameList_new();
+    }
+    ma_uint64 got = 0;
+    ma_decoder_read_pcm_frames(&dec, pcm, frames, &got);
+    ma_decoder_uninit(&dec);
+    AmalgameList* out = _amaudio_buf_from_pcm(pcm, (size_t) got * channels);
+    free(pcm);
+    _amaudio_set_error(NULL);
+    return out;
+}
+
+/* ── Resample ───────────────────────────────────────────── */
+
+/* Linear-interpolation resample of a MONO int16 buffer from
+ * srcRate to dstRate Hz. Deliberately simple (no windowed-sinc
+ * filtering) — this package's use case is voice content ahead of
+ * RNNoise (which itself demands 48kHz), not music mastering.
+ * Channel-agnostic by contract: for stereo, de-interleave and
+ * call twice (once per channel), same division of labour as
+ * DenoiseVoice. srcRate == dstRate returns a fresh copy rather
+ * than a no-op passthrough, consistent with every other transform
+ * in this package returning a new buffer. */
+static inline AmalgameList* Amalgame_Audio_Resample(
+        AmalgameList* samples, i64 srcRate, i64 dstRate) {
+    if (!samples || srcRate <= 0 || dstRate <= 0) {
+        _amaudio_set_error("Resample: null buf or invalid rate");
+        return AmalgameList_new();
+    }
+    size_t n = (size_t) AmalgameList_count(samples);
+    if (n == 0) return AmalgameList_new();
+    if (srcRate == dstRate) return Amalgame_Audio_Scale(samples, 1.0);
+
+    double ratio = (double) dstRate / (double) srcRate;
+    size_t outN = (size_t) ((double) n * ratio);
+    if (outN == 0) return AmalgameList_new();
+
+    size_t srcN = 0;
+    int16_t* src = _amaudio_pcm_from_buf(samples, &srcN);
+    if (!src) { _amaudio_set_error("Resample: OOM"); return AmalgameList_new(); }
+
+    int16_t* out = (int16_t*) malloc(outN * sizeof(int16_t));
+    if (!out) {
+        free(src);
+        _amaudio_set_error("Resample: OOM");
+        return AmalgameList_new();
+    }
+    for (size_t i = 0; i < outN; i++) {
+        double srcPos = (double) i / ratio;
+        size_t i0 = (size_t) srcPos;
+        size_t i1 = i0 + 1 < srcN ? i0 + 1 : srcN - 1;
+        double frac = srcPos - (double) i0;
+        double v = (double) src[i0] * (1.0 - frac) + (double) src[i1] * frac;
+        if (v >  32767.0) v =  32767.0;
+        if (v < -32768.0) v = -32768.0;
+        out[i] = (int16_t) v;
+    }
+    free(src);
+    AmalgameList* result = _amaudio_buf_from_pcm(out, outN);
+    free(out);
+    _amaudio_set_error(NULL);
+    return result;
+}
+
+/* ── DenoiseVoice (RNNoise) ─────────────────────────────── */
+
+/* Suppress background noise from a MONO 48kHz int16 buffer via
+ * RNNoise (github.com/xiph/rnnoise v0.1.1, vendored under
+ * runtime/vendor/rnnoise/, BSD-3-Clause — see NOTICE.md). Not
+ * channel- or rate-aware itself: resample to 48kHz first
+ * (Audio.Resample) if needed, and for stereo, de-interleave and
+ * call this once per channel, same division of labour as Resample.
+ *
+ * RNNoise processes fixed 480-sample (10ms) frames and has a
+ * ONE-FRAME internal lookahead — its own reference example
+ * (examples/rnnoise_demo.c) drops the very first output frame for
+ * exactly this reason, or the whole output is shifted 10ms early
+ * relative to the input. We instead pad one extra silent frame
+ * onto the END (to flush the true last frame through the
+ * lookahead) and drop the first frame from the FRONT of the
+ * output, so what comes back is time-aligned AND the same length
+ * as what went in — no manual frame-juggling required by callers. */
+static inline AmalgameList* Amalgame_Audio_DenoiseVoice(AmalgameList* samples) {
+    if (!samples) { _amaudio_set_error("DenoiseVoice: null buf"); return AmalgameList_new(); }
+    size_t srcN = (size_t) AmalgameList_count(samples);
+    if (srcN == 0) return AmalgameList_new();
+
+    int frameSize = rnnoise_get_frame_size();   /* 480 for this model */
+    size_t numFrames = (srcN + (size_t) frameSize - 1) / (size_t) frameSize;
+    size_t paddedN = (numFrames + 1) * (size_t) frameSize;   /* +1 flush frame */
+
+    float* buf = (float*) calloc(paddedN, sizeof(float));
+    if (!buf) { _amaudio_set_error("DenoiseVoice: OOM"); return AmalgameList_new(); }
+    for (size_t i = 0; i < srcN; i++) {
+        buf[i] = (float) (i64) (intptr_t) AmalgameList_get(samples, (i64) i);
+    }
+
+    DenoiseState* st = rnnoise_create(NULL);
+    if (!st) {
+        free(buf);
+        _amaudio_set_error("DenoiseVoice: rnnoise_create failed");
+        return AmalgameList_new();
+    }
+    size_t totalFrames = paddedN / (size_t) frameSize;
+    for (size_t f = 0; f < totalFrames; f++) {
+        float* frame = buf + f * (size_t) frameSize;
+        rnnoise_process_frame(st, frame, frame);   /* in-place, per upstream convention */
+    }
+    rnnoise_destroy(st);
+
+    /* Valid, time-aligned output starts one frame in. */
+    int16_t* outPcm = (int16_t*) malloc(srcN * sizeof(int16_t));
+    if (!outPcm) { free(buf); _amaudio_set_error("DenoiseVoice: OOM"); return AmalgameList_new(); }
+    for (size_t i = 0; i < srcN; i++) {
+        float v = buf[(size_t) frameSize + i];
+        if (v >  32767.0f) v =  32767.0f;
+        if (v < -32768.0f) v = -32768.0f;
+        outPcm[i] = (int16_t) v;
+    }
+    free(buf);
+    AmalgameList* out = _amaudio_buf_from_pcm(outPcm, srcN);
+    free(outPcm);
+    _amaudio_set_error(NULL);
+    return out;
+}
+
+/* ── SaveAsOpusStereo / SaveAsOpusMono ──────────────────── */
+
+/* libopus only emits raw codec packets — RFC 7845 requires Opus
+ * audio to live inside an Ogg container to be a valid, playable
+ * `.opus` file (what every browser's <audio> element expects).
+ * These helpers mux via libopus (encode) + libogg (container),
+ * both vendored under runtime/vendor/ — see NOTICE.md. */
+
+static inline void _amaudio_put_le16(unsigned char* buf, uint16_t v) {
+    buf[0] = (unsigned char) (v & 0xFF);
+    buf[1] = (unsigned char) ((v >> 8) & 0xFF);
+}
+static inline void _amaudio_put_le32(unsigned char* buf, uint32_t v) {
+    buf[0] = (unsigned char) (v & 0xFF);
+    buf[1] = (unsigned char) ((v >> 8) & 0xFF);
+    buf[2] = (unsigned char) ((v >> 16) & 0xFF);
+    buf[3] = (unsigned char) ((v >> 24) & 0xFF);
+}
+
+/* RFC 7845 §5.1 — Identification Header. Channel mapping family 0
+ * (mono/stereo, no extra mapping table) is all we ever emit. */
+static inline int _amaudio_write_opus_head(unsigned char* buf, int channels, int preSkip, int inputSampleRate) {
+    memcpy(buf, "OpusHead", 8);
+    buf[8] = 1;                                    /* version */
+    buf[9] = (unsigned char) channels;
+    _amaudio_put_le16(buf + 10, (uint16_t) preSkip);
+    _amaudio_put_le32(buf + 12, (uint32_t) inputSampleRate);
+    _amaudio_put_le16(buf + 16, 0);                /* output gain = 0 */
+    buf[18] = 0;                                    /* channel mapping family 0 */
+    return 19;
+}
+
+/* RFC 7845 §5.2 — Comment Header. Vendor string + zero user
+ * comments; nothing here is user-facing metadata. */
+static inline int _amaudio_write_opus_tags(unsigned char* buf) {
+    memcpy(buf, "OpusTags", 8);
+    const char* vendor = "amalgame-audio";
+    uint32_t vlen = (uint32_t) strlen(vendor);
+    _amaudio_put_le32(buf + 8, vlen);
+    memcpy(buf + 12, vendor, vlen);
+    _amaudio_put_le32(buf + 12 + (int) vlen, 0);   /* 0 user comments */
+    return 12 + (int) vlen + 4;
+}
+
+/* Shared encode+mux implementation. `channels` is authoritative —
+ * for channels=2, `samples` must already be interleaved (L0 R0 L1
+ * R1...); for channels=1, a flat mono buffer. sampleRate MUST be
+ * 48000 (Opus's one truly native rate, and the rate this whole
+ * package's denoise/resample pipeline already standardises the
+ * "enriched" path on) — resample first via Audio.Resample if the
+ * working buffer is at a different rate; kept as an explicit
+ * precondition rather than resampling internally so this function
+ * has exactly one job. */
+static code_bool _amaudio_save_opus(AmalgameList* samples, i64 sampleRate, int channels, code_string path) {
+    if (!samples || !path) { _amaudio_set_error("SaveAsOpus: null arg"); return 0; }
+    if (sampleRate != 48000) {
+        _amaudio_set_error("SaveAsOpus: sampleRate must be 48000 (resample first)");
+        return 0;
+    }
+    size_t totalSamples = (size_t) AmalgameList_count(samples);
+    if (channels == 2 && totalSamples % 2 != 0) {
+        _amaudio_set_error("SaveAsOpus: stereo buffer length must be even");
+        return 0;
+    }
+    size_t totalFrames = totalSamples / (size_t) channels;
+    if (totalFrames == 0) { _amaudio_set_error("SaveAsOpus: empty buffer"); return 0; }
+
+    int err = 0;
+    OpusEncoder* enc = opus_encoder_create(48000, channels, OPUS_APPLICATION_AUDIO, &err);
+    if (err != OPUS_OK || !enc) {
+        _amaudio_set_error("SaveAsOpus: opus_encoder_create failed");
+        return 0;
+    }
+    opus_int32 lookahead = 0;
+    opus_encoder_ctl(enc, OPUS_GET_LOOKAHEAD(&lookahead));
+
+    const int frameSize = 960;   /* 20 ms @ 48kHz — a standard, safe default */
+    size_t numFrames = (totalFrames + (size_t) frameSize - 1) / (size_t) frameSize;
+
+    int16_t* pcm = (int16_t*) calloc(numFrames * (size_t) frameSize * (size_t) channels, sizeof(int16_t));
+    if (!pcm) { opus_encoder_destroy(enc); _amaudio_set_error("SaveAsOpus: OOM"); return 0; }
+    for (size_t i = 0; i < totalSamples; i++) {
+        i64 v = (i64) (intptr_t) AmalgameList_get(samples, (i64) i);
+        if (v >  32767) v =  32767;
+        if (v < -32768) v = -32768;
+        pcm[i] = (int16_t) v;
+    }
+
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        free(pcm); opus_encoder_destroy(enc);
+        _amaudio_set_error("SaveAsOpus: cannot open outPath");
+        return 0;
+    }
+
+    ogg_stream_state os;
+    ogg_stream_init(&os, 12345);
+    ogg_packet op;
+    ogg_page ogp;
+
+    unsigned char headBuf[19];
+    int headLen = _amaudio_write_opus_head(headBuf, channels, (int) lookahead, 48000);
+    memset(&op, 0, sizeof(op));
+    op.packet = headBuf; op.bytes = headLen; op.b_o_s = 1; op.granulepos = 0; op.packetno = 0;
+    ogg_stream_packetin(&os, &op);
+    while (ogg_stream_flush(&os, &ogp)) {
+        fwrite(ogp.header, 1, (size_t) ogp.header_len, f);
+        fwrite(ogp.body, 1, (size_t) ogp.body_len, f);
+    }
+
+    unsigned char tagsBuf[256];
+    int tagsLen = _amaudio_write_opus_tags(tagsBuf);
+    memset(&op, 0, sizeof(op));
+    op.packet = tagsBuf; op.bytes = tagsLen; op.granulepos = 0; op.packetno = 1;
+    ogg_stream_packetin(&os, &op);
+    while (ogg_stream_flush(&os, &ogp)) {
+        fwrite(ogp.header, 1, (size_t) ogp.header_len, f);
+        fwrite(ogp.body, 1, (size_t) ogp.body_len, f);
+    }
+
+    unsigned char packetBuf[4000];
+    ogg_int64_t packetno = 2;
+    int ok = 1;
+    for (size_t fi = 0; fi < numFrames && ok; fi++) {
+        int16_t* frame = pcm + fi * (size_t) frameSize * (size_t) channels;
+        int nbytes = opus_encode(enc, frame, frameSize, packetBuf, (opus_int32) sizeof(packetBuf));
+        if (nbytes < 0) { ok = 0; break; }
+
+        int isLast = (fi == numFrames - 1);
+        /* Granule position = real PCM samples encoded so far
+         * (including pre-skip), clamped to the true (unpadded)
+         * length on the last frame — per RFC 7845, this tells
+         * players to trim the silence we padded the final frame
+         * with rather than play it back audibly. */
+        ogg_int64_t framesSoFar = (ogg_int64_t) (fi + 1) * frameSize;
+        ogg_int64_t realFrames  = (ogg_int64_t) totalFrames;
+        ogg_int64_t granule = (framesSoFar < realFrames ? framesSoFar : realFrames) + lookahead;
+
+        memset(&op, 0, sizeof(op));
+        op.packet = packetBuf; op.bytes = nbytes;
+        op.e_o_s = isLast ? 1 : 0;
+        op.granulepos = granule;
+        op.packetno = packetno++;
+        ogg_stream_packetin(&os, &op);
+
+        if (isLast) {
+            while (ogg_stream_flush(&os, &ogp)) {
+                fwrite(ogp.header, 1, (size_t) ogp.header_len, f);
+                fwrite(ogp.body, 1, (size_t) ogp.body_len, f);
+            }
+        } else {
+            while (ogg_stream_pageout(&os, &ogp)) {
+                fwrite(ogp.header, 1, (size_t) ogp.header_len, f);
+                fwrite(ogp.body, 1, (size_t) ogp.body_len, f);
+            }
+        }
+    }
+
+    ogg_stream_clear(&os);
+    fclose(f);
+    free(pcm);
+    opus_encoder_destroy(enc);
+
+    if (!ok) { remove(path); _amaudio_set_error("SaveAsOpus: opus_encode failed"); return 0; }
+    _amaudio_set_error(NULL);
+    return 1;
+}
+
+/* Stereo input MUST already be interleaved (L0 R0 L1 R1...) — see
+ * Audio.LoadNativeChannels / Audio.MonoToStereo for how to get
+ * there. sampleRate must be 48000. */
+static inline code_bool Amalgame_Audio_SaveAsOpusStereo(AmalgameList* samples, i64 sampleRate, code_string path) {
+    return _amaudio_save_opus(samples, sampleRate, 2, path);
+}
+
+/* Mono input, flat buffer. sampleRate must be 48000. */
+static inline code_bool Amalgame_Audio_SaveAsOpusMono(AmalgameList* samples, i64 sampleRate, code_string path) {
+    return _amaudio_save_opus(samples, sampleRate, 1, path);
 }
 
 #endif /* AMALGAME_AUDIO_H */

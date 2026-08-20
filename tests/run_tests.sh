@@ -71,10 +71,81 @@ fi
 echo "  ma_impl.o: $(stat -c%s "$MA_IMPL_O" 2>/dev/null || stat -f%z "$MA_IMPL_O") bytes"
 echo ""
 
+# ── Precompile rnnoise_impl.c once (v0.8 — RNNoise unity build) ──
+echo "── Precompiling vendored rnnoise_impl.c ──"
+RNNOISE_IMPL_O="$BUILD_DIR/rnnoise_impl.o"
+if ! gcc -O2 -w -c \
+        -I"$AMC_RUNTIME" \
+        "$PKG_VENDOR/rnnoise_impl.c" \
+        -o "$RNNOISE_IMPL_O" 2>"$BUILD_DIR/rnn.log"; then
+    echo -e "${RED}FAIL${NC} rnnoise_impl.c compile:"
+    cat "$BUILD_DIR/rnn.log" | head -5 | sed 's/^/    /'
+    exit 1
+fi
+echo "  rnnoise_impl.o: $(stat -c%s "$RNNOISE_IMPL_O" 2>/dev/null || stat -f%z "$RNNOISE_IMPL_O") bytes"
+echo ""
+
+# ── Precompile the v0.8 libopus + libogg TUs ────────
+# -DOPUS_BUILD -DUSE_ALLOCA: required by libopus's own sources
+# (matches its Makefile.unix exactly) — harmless no-ops for
+# ogg_impl.c. celt_encoder.c/celt_decoder.c are split out of
+# opus_impl.c's unity build deliberately — see opus_impl.c's own
+# header comment for the real declaration-mismatch reason.
+echo "── Precompiling vendored libopus + libogg (slow — real codec, ~20-30s) ──"
+OPUS_IMPL_O="$BUILD_DIR/opus_impl.o"
+OPUS_CE_O="$BUILD_DIR/opus_celt_encoder_impl.o"
+OPUS_CD_O="$BUILD_DIR/opus_celt_decoder_impl.o"
+OGG_IMPL_O="$BUILD_DIR/ogg_impl.o"
+OPUS_CFLAGS="-DOPUS_BUILD -DUSE_ALLOCA"
+compile_ok=1
+for pair in "opus_impl.c:$OPUS_IMPL_O:$OPUS_CFLAGS" \
+            "opus_celt_encoder_impl.c:$OPUS_CE_O:$OPUS_CFLAGS" \
+            "opus_celt_decoder_impl.c:$OPUS_CD_O:$OPUS_CFLAGS" \
+            "ogg_impl.c:$OGG_IMPL_O:"; do
+    src="${pair%%:*}"; rest="${pair#*:}"; obj="${rest%%:*}"; extra="${rest#*:}"
+    if [ "$extra" = "$rest" ]; then extra=""; fi
+    if ! gcc -O2 -w $extra -c \
+            -I"$AMC_RUNTIME" \
+            "$PKG_VENDOR/$src" \
+            -o "$obj" 2>"$BUILD_DIR/$src.log"; then
+        echo -e "${RED}FAIL${NC} $src compile:"
+        cat "$BUILD_DIR/$src.log" | head -8 | sed 's/^/    /'
+        compile_ok=0
+    fi
+done
+[ "$compile_ok" -eq 1 ] || exit 1
+echo "  opus_impl.o: $(stat -c%s "$OPUS_IMPL_O" 2>/dev/null || stat -f%z "$OPUS_IMPL_O") bytes"
+echo "  opus_celt_encoder_impl.o + opus_celt_decoder_impl.o + ogg_impl.o: ok"
+echo ""
+
+# ── Generate the v0.8 Mp3FrameSplice fixture ────────
+# ~1s @ 300Hz gain 0.1 (quiet) followed by ~1s @ 300Hz gain 0.9
+# (loud), mono 44100 Hz MP3 — lets the reorder test tell the two
+# halves apart by amplitude alone (no FFT needed). Needs ffmpeg +
+# libmp3lame; skip the MP3 tests gracefully if unavailable rather
+# than failing the whole suite over a missing dev tool.
+MP3_FIXTURE="/tmp/amc_audio_test_fixture.mp3"
+HAVE_MP3_FIXTURE=0
+if command -v ffmpeg >/dev/null 2>&1; then
+    if ffmpeg -y -f lavfi -i "sine=frequency=300:duration=1,volume=0.1" \
+              -f lavfi -i "sine=frequency=300:duration=1,volume=0.9" \
+              -filter_complex "[0][1]concat=n=2:v=0:a=1" \
+              -ac 1 -ar 44100 -codec:a libmp3lame -b:a 128k \
+              "$MP3_FIXTURE" >"$BUILD_DIR/fixture.log" 2>&1; then
+        HAVE_MP3_FIXTURE=1
+        echo "  MP3 fixture: $MP3_FIXTURE ($(stat -c%s "$MP3_FIXTURE" 2>/dev/null || stat -f%z "$MP3_FIXTURE") bytes)"
+    else
+        echo -e "  ${YELLOW}MP3 fixture generation failed — Mp3FrameSplice tests will SKIP${NC}"
+    fi
+else
+    echo -e "  ${YELLOW}ffmpeg not found — Mp3FrameSplice tests will SKIP${NC}"
+fi
+echo ""
+
 # ── Stage a fake cache pointing at the working tree ──
 FAKE_CACHE="$BUILD_DIR/cache"
 PKG_GIT="github.com/amalgame-lang/amalgame-audio"
-PKG_TAG="${PKG_TAG:-v0.7.0}"
+PKG_TAG="${PKG_TAG:-v0.8.0}"
 FAKE_SHA="deadbeefcafebabe0000000000000000000000ab"
 SHORT_SHA="${FAKE_SHA:0:8}"
 PKG_CACHE_DIR="$FAKE_CACHE/$PKG_GIT/${PKG_TAG}_${SHORT_SHA}"
@@ -111,10 +182,11 @@ run_test() {
     if [ ! -f "$out_base.c" ]; then
         echo -e "${RED}FAIL${NC} (no .c)"; FAIL=$((FAIL + 1)); return
     fi
-    # Two-TU link: user .c + precompiled ma_impl.o + miniaudio's link deps
+    # Multi-TU link: user .c + all precompiled vendored .o's + link deps
     gcc -O2 -w \
         -I"$AMC_RUNTIME" -I"$PKG_RUNTIME" -I"$PKG_VENDOR" \
-        "$out_base.c" "$MA_IMPL_O" \
+        "$out_base.c" "$MA_IMPL_O" "$RNNOISE_IMPL_O" \
+        "$OPUS_IMPL_O" "$OPUS_CE_O" "$OPUS_CD_O" "$OGG_IMPL_O" \
         -lgc -lm -lcurl -ldl -lpthread \
         -o "$out_base" 2>"$BUILD_DIR/link.log"
     if [ ! -x "$out_base" ]; then
@@ -213,6 +285,30 @@ run_test "SaveAsWavStereo"            "[PASS] SaveAsWavStereo"
 run_test "LoadWavStereo length"       "[PASS] LoadWavStereo length round-trip"
 run_test "Stereo WAV 2 channels"      "[PASS] Stereo WAV has 2 channels"
 run_test "StereoToMono odd reject"    "[PASS] StereoToMono rejects odd-length input"
+
+echo ""
+echo "── Audio v0.8 (lossless splice + native channels) ─"
+run_test "WavSplice returns true"       "[PASS] WavSplice returns true"
+run_test "WavSplice output length"      "[PASS] WavSplice output length = 200"
+run_test "WavSplice content + reorder"  "[PASS] WavSplice content + reorder correct"
+run_test "LoadNativeChannels mono"      "[PASS] LoadNativeChannels mono length"
+run_test "LoadNativeChannels stereo"    "[PASS] LoadNativeChannels stereo length"
+run_test "Resample 8k->16k"             "[PASS] Resample 8k->16k doubles length"
+run_test "Resample identity"            "[PASS] Resample identity preserves samples"
+run_test "Mp3FrameSplice reorder"       "[PASS] Mp3FrameSplice reorder: loud half then quiet half" \
+                                         "[SKIP] Mp3FrameSplice reorder (no fixture)"
+run_test "Mp3FrameSplice full-range"    "[PASS] Mp3FrameSplice full-range duration ~ unchanged" \
+                                         "[SKIP] Mp3FrameSplice full-range (no fixture)"
+run_test "Mp3FrameSplice rejects non-MP3" "[PASS] Mp3FrameSplice rejects non-MP3 source" \
+                                         "[SKIP] Mp3FrameSplice rejects non-MP3 (no fixture)"
+run_test "DenoiseVoice length"          "[PASS] DenoiseVoice output length matches input"
+run_test "DenoiseVoice attenuates noise" "[PASS] DenoiseVoice reduces broadband noise energy"
+run_test "DenoiseVoice empty input"     "[PASS] DenoiseVoice on empty buffer returns empty"
+run_test "SaveAsOpusMono returns true"  "[PASS] SaveAsOpusMono returns true"
+run_test "SaveAsOpusMono OggS magic"    "[PASS] SaveAsOpusMono output starts with OggS"
+run_test "SaveAsOpusStereo returns true" "[PASS] SaveAsOpusStereo returns true"
+run_test "SaveAsOpusStereo OggS magic"  "[PASS] SaveAsOpusStereo output starts with OggS"
+run_test "SaveAsOpus rejects bad rate"  "[PASS] SaveAsOpus rejects non-48000 sample rate"
 
 echo ""
 echo "────────────────────────────────────────────"
