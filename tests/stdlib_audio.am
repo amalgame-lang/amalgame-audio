@@ -13,7 +13,7 @@ public class Program {
         let sr: int = 44100
 
         // ── 1. GenSine — sample count matches duration × sr ───
-        let sine = Audio.GenSine(440.0, 0.1, sr)   // 100 ms A4
+        let sine: List<int> = Audio.GenSine(440.0, 0.1, sr)   // 100 ms A4
         if (sine.Count() == 4410) {
             Console.WriteLine("[PASS] GenSine length")
         } else {
@@ -22,7 +22,7 @@ public class Program {
         }
 
         // ── 2. GenSilence — same length, all zeros ────────────
-        let sil = Audio.GenSilence(0.1, sr)
+        let sil: List<int> = Audio.GenSilence(0.1, sr)
         if (sil.Count() == 4410 && sil.Get(0) == 0 && sil.Get(2200) == 0) {
             Console.WriteLine("[PASS] GenSilence is silent")
         } else {
@@ -53,7 +53,7 @@ public class Program {
         }
 
         // ── 4. Envelope — first sample is ~0 (attack ramp) ────
-        let shaped = Audio.ApplyEnvelope(sine, 10.0, 10.0, sr)
+        let shaped: List<int> = Audio.ApplyEnvelope(sine, 10.0, 10.0, sr)
         let first: int = shaped.Get(0)
         if (first == 0) {
             Console.WriteLine("[PASS] envelope first sample = 0")
@@ -63,7 +63,7 @@ public class Program {
         }
 
         // ── 5. Scale 0.5 halves the magnitudes (sample 1000) ──
-        let half = Audio.Scale(sine, 0.5)
+        let half: List<int> = Audio.Scale(sine, 0.5)
         let s1: int = sine.Get(1000)
         let s2: int = half.Get(1000)
         let diff: int = (s1 / 2) - s2
@@ -81,7 +81,7 @@ public class Program {
 
 
         // ── 6. Mix — overlay silence offset 0 is identity ─────
-        let mix1 = Audio.Mix(sine, sil, 0)
+        let mix1: List<int> = Audio.Mix(sine, sil, 0)
         let lenOk: bool   = mix1.Count() == sine.Count()
         let valOk: bool   = mix1.Get(500) == sine.Get(500)
         if (lenOk && valOk) {
@@ -92,7 +92,7 @@ public class Program {
 
         // ── 7. Echo — output length matches formula ───────────
         // Length = len(samples) + repeats * (delayMs * sr / 1000)
-        let echoed = Audio.Echo(sine, 100.0, 0.5, 3, sr)
+        let echoed: List<int> = Audio.Echo(sine, 100.0, 0.5, 3, sr)
         let expect = 4410 + 3 * 4410   // 100ms at 44100 = 4410
         if (echoed.Count() == expect) {
             Console.WriteLine("[PASS] Echo length matches formula")
@@ -111,7 +111,7 @@ public class Program {
             Console.WriteLine("[FAIL] SaveAsWav: " + Audio.LastError())
             return
         }
-        let back = Audio.LoadWav(path)
+        let back: List<int> = Audio.LoadWav(path)
         if (back.Count() == sine.Count()) {
             Console.WriteLine("[PASS] LoadWav length round-trip")
         } else {
@@ -160,7 +160,7 @@ public class Program {
         }
 
         // ── 12. Load (format-agnostic) ────────────────────────
-        let agnostic = Audio.Load(path)
+        let agnostic: List<int> = Audio.Load(path)
         if (agnostic.Count() == sine.Count()) {
             Console.WriteLine("[PASS] Load auto-detects WAV")
         } else {
@@ -190,7 +190,7 @@ public class Program {
         // enough not to slow the suite, long enough to exercise the
         // callback's write path on real hardware.
 
-        let probe = Audio.Record(0.05, 16000)
+        let probe: List<int> = Audio.Record(0.05, 16000)
         let probeN: int = probe.Count()
         let haveCapture: bool = (probeN == 800)
 
@@ -205,7 +205,7 @@ public class Program {
         if (haveCapture) {
             let h = Audio.RecordStart(1.0, 16000)
             let active1: bool = Audio.RecordIsActive(h)
-            let cap1 = Audio.RecordStop(h)
+            let cap1: List<int> = Audio.RecordStop(h)
             // active1 must be true (started, not stopped yet).
             // Buffer count is non-negative by construction.
             // NB: don't touch h after RecordStop — it's freed.
@@ -232,7 +232,7 @@ public class Program {
         // long enough that PlayIsActive stays true while we run
         // the state-machine assertions (PlayPause → PlayResume).
 
-        let silentBuf = Audio.GenSilence(1.0, 16000)
+        let silentBuf: List<int> = Audio.GenSilence(1.0, 16000)
         let probeH = Audio.PlayStart(silentBuf, 16000)
         // AM lacks a syntax for "is this pointer null" on opaque
         // handles — we lean on PlayIsActive which returns false
@@ -309,8 +309,8 @@ public class Program {
             }
 
             // ── 19. AddSource × 2, expect 2 alive ─────────────
-            let tone1 = Audio.GenSine(440.0, 0.5, 16000)
-            let tone2 = Audio.GenSine(550.0, 0.5, 16000)
+            let tone1: List<int> = Audio.GenSine(440.0, 0.5, 16000)
+            let tone2: List<int> = Audio.GenSine(550.0, 0.5, 16000)
             let v1: int = Audio.MixerAddSource(m, tone1, 0.5, false)
             let v2: int = Audio.MixerAddSource(m, tone2, 0.5, false)
             let cnt2: int = Audio.MixerSourceCount(m)
@@ -410,7 +410,7 @@ public class Program {
         }
 
         // ── 25. LoadSmf reads back the same event count ──────
-        let backEvs = Audio.MidiLoadSmf(smfPath)
+        let backEvs: List<int> = Audio.MidiLoadSmf(smfPath)
         // We wrote 6 events × 4 ints = 24 quads. The loader
         // returns the same event stream — no extra events except
         // the tempo meta we prepended on save (which becomes the
@@ -450,7 +450,7 @@ public class Program {
         // Three quarters at 120 BPM at 44.1kHz = ~1.5 s × 44100 ≈
         // 66150 samples. v0.7 adds a 30 ms release tail flush at
         // end-of-stream, so the upper bound becomes ~67500.
-        let rendered = Audio.MidiRenderToAudio(backEvs, 480, 500000, 44100)
+        let rendered: List<int> = Audio.MidiRenderToAudio(backEvs, 480, 500000, 44100)
         let rN: int = rendered.Count()
         if (rN > 60000 && rN < 80000) {
             Console.WriteLine("[PASS] MidiRenderToAudio length in range")
@@ -512,7 +512,7 @@ public class Program {
         }
 
         // ── 31. LoadSmf on missing file returns empty + error ─
-        let missing = Audio.MidiLoadSmf("/tmp/does_not_exist.mid")
+        let missing: List<int> = Audio.MidiLoadSmf("/tmp/does_not_exist.mid")
         if (missing.Count() == 0) {
             Console.WriteLine("[PASS] MidiLoadSmf rejects missing file")
         } else {
@@ -527,8 +527,8 @@ public class Program {
         // Pure data-pipeline tests, no device deps.
 
         // ── 32. MonoToStereo doubles the count, L=R ──────────
-        let monoTest = Audio.GenSine(440.0, 0.1, 44100)   // 4410 samples
-        let stereoTest = Audio.MonoToStereo(monoTest)
+        let monoTest: List<int> = Audio.GenSine(440.0, 0.1, 44100)   // 4410 samples
+        let stereoTest: List<int> = Audio.MonoToStereo(monoTest)
         // Stereo: every mono sample appears twice (interleaved).
         // Count should be 2 × 4410 = 8820.
         if (stereoTest.Count() == 8820) {
@@ -551,7 +551,7 @@ public class Program {
         }
 
         // ── 34. StereoToMono(MonoToStereo(x)) == x (round-trip) ─
-        let backMono = Audio.StereoToMono(stereoTest)
+        let backMono: List<int> = Audio.StereoToMono(stereoTest)
         let lenOk2: bool = backMono.Count() == monoTest.Count()
         let val0: bool = backMono.Get(500) == monoTest.Get(500)
         let val1: bool = backMono.Get(2000) == monoTest.Get(2000)
@@ -569,7 +569,7 @@ public class Program {
         } else {
             Console.WriteLine("[FAIL] SaveAsWavStereo: " + Audio.LastError())
         }
-        let stBack = Audio.LoadWavStereo(stPath)
+        let stBack: List<int> = Audio.LoadWavStereo(stPath)
         if (stBack.Count() == stereoTest.Count()) {
             Console.WriteLine("[PASS] LoadWavStereo length round-trip")
         } else {
@@ -590,7 +590,7 @@ public class Program {
         // ── 37. StereoToMono rejects odd-length input ────────
         let badStereo = new List<int>()
         badStereo.Add(100); badStereo.Add(200); badStereo.Add(300)   // 3 ints
-        let badMono = Audio.StereoToMono(badStereo)
+        let badMono: List<int> = Audio.StereoToMono(badStereo)
         if (badMono.Count() == 0) {
             Console.WriteLine("[PASS] StereoToMono rejects odd-length input")
         } else {
@@ -625,7 +625,7 @@ public class Program {
         } else {
             Console.WriteLine("[FAIL] WavSplice: " + Audio.LastError())
         }
-        let spliced = Audio.LoadWav(splicedPath)
+        let spliced: List<int> = Audio.LoadWav(splicedPath)
         if (spliced.Count() == 200) {
             Console.WriteLine("[PASS] WavSplice output length = 200")
         } else {
@@ -646,7 +646,7 @@ public class Program {
         }
 
         // ── 39. LoadNativeChannels — mono stays mono ──────────
-        let monoNative = Audio.LoadNativeChannels(rampPath)
+        let monoNative: List<int> = Audio.LoadNativeChannels(rampPath)
         if (monoNative.Count() == 2000) {
             Console.WriteLine("[PASS] LoadNativeChannels mono length")
         } else {
@@ -655,7 +655,7 @@ public class Program {
         }
 
         // ── 40. LoadNativeChannels — stereo stays interleaved ─
-        let nativeStereo = Audio.LoadNativeChannels(stPath)
+        let nativeStereo: List<int> = Audio.LoadNativeChannels(stPath)
         if (nativeStereo.Count() == stereoTest.Count()) {
             Console.WriteLine("[PASS] LoadNativeChannels stereo length")
         } else {
@@ -665,8 +665,8 @@ public class Program {
         }
 
         // ── 41. Resample — upsampling roughly doubles length ──
-        let rsSrc = Audio.GenSine(440.0, 0.1, 8000)   // 800 samples @ 8kHz
-        let rsOut = Audio.Resample(rsSrc, 8000, 16000)
+        let rsSrc: List<int> = Audio.GenSine(440.0, 0.1, 8000)   // 800 samples @ 8kHz
+        let rsOut: List<int> = Audio.Resample(rsSrc, 8000, 16000)
         let rsLen: int = rsOut.Count()
         if (rsLen == 1600) {
             Console.WriteLine("[PASS] Resample 8k->16k doubles length")
@@ -675,7 +675,7 @@ public class Program {
         }
 
         // ── 42. Resample identity (srcRate == dstRate) copies ─
-        let rsSame = Audio.Resample(rsSrc, 8000, 8000)
+        let rsSame: List<int> = Audio.Resample(rsSrc, 8000, 8000)
         if (rsSame.Count() == rsSrc.Count() && rsSame.Get(50) == rsSrc.Get(50)) {
             Console.WriteLine("[PASS] Resample identity preserves samples")
         } else {
@@ -710,7 +710,7 @@ public class Program {
             Console.WriteLine("[FAIL] Mp3FrameSplice: " + Audio.LastError())
         }
 
-        let mp3Spliced = Audio.LoadMp3(mp3OutPath)
+        let mp3Spliced: List<int> = Audio.LoadMp3(mp3OutPath)
         let mp3N: int = mp3Spliced.Count()
         if (mp3N > 0) {
             Console.WriteLine("[PASS] Mp3FrameSplice output decodes to non-empty audio")
@@ -776,8 +776,8 @@ public class Program {
         }   // end haveFixture
 
         // ── 46. DenoiseVoice — output length matches input ────
-        let noiseSrc = Audio.GenNoise(0.5, 48000)   // 24000 samples @ 48kHz
-        let denoised = Audio.DenoiseVoice(noiseSrc)
+        let noiseSrc: List<int> = Audio.GenNoise(0.5, 48000)   // 24000 samples @ 48kHz
+        let denoised: List<int> = Audio.DenoiseVoice(noiseSrc)
         if (denoised.Count() == noiseSrc.Count()) {
             Console.WriteLine("[PASS] DenoiseVoice output length matches input")
         } else {
@@ -815,7 +815,7 @@ public class Program {
 
         // ── 48. DenoiseVoice on empty buffer returns empty ────
         let emptyBuf = new List<int>()
-        let emptyDenoised = Audio.DenoiseVoice(emptyBuf)
+        let emptyDenoised: List<int> = Audio.DenoiseVoice(emptyBuf)
         if (emptyDenoised.Count() == 0) {
             Console.WriteLine("[PASS] DenoiseVoice on empty buffer returns empty")
         } else {
@@ -834,7 +834,7 @@ public class Program {
         // decoder. The actual opus_encode() call path was already
         // validated end-to-end manually before vendoring (see
         // amalgame.toml's [stdlib] comment history / dev notes).
-        let opusSrc = Audio.GenSine(440.0, 0.3, 48000)   // 14400 samples
+        let opusSrc: List<int> = Audio.GenSine(440.0, 0.3, 48000)   // 14400 samples
         let opusMonoPath: string = "/tmp/amc_audio_opus_mono_test.opus"
         let opusMonoOk: bool = Audio.SaveAsOpusMono(opusSrc, 48000, opusMonoPath)
         if (opusMonoOk) {
@@ -850,7 +850,7 @@ public class Program {
         }
 
         // ── 50. SaveAsOpusStereo — writes a valid Ogg container ─
-        let opusStereoSrc = Audio.MonoToStereo(opusSrc)
+        let opusStereoSrc: List<int> = Audio.MonoToStereo(opusSrc)
         let opusStereoPath: string = "/tmp/amc_audio_opus_stereo_test.opus"
         let opusStereoOk: bool = Audio.SaveAsOpusStereo(opusStereoSrc, 48000, opusStereoPath)
         if (opusStereoOk) {
@@ -866,7 +866,7 @@ public class Program {
         }
 
         // ── 51. SaveAsOpus rejects a non-48000 sample rate ────
-        let opusBadSrc = Audio.GenSine(440.0, 0.1, 44100)
+        let opusBadSrc: List<int> = Audio.GenSine(440.0, 0.1, 44100)
         let opusBadOk: bool = Audio.SaveAsOpusMono(opusBadSrc, 44100, "/tmp/amc_audio_opus_bad_test.opus")
         if (!opusBadOk) {
             Console.WriteLine("[PASS] SaveAsOpus rejects non-48000 sample rate")
